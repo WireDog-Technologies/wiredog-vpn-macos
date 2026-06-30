@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>WireDog Tunnel</string>
+    <key>CFBundleExecutable</key>
+    <string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.wiredog.vpn.macos.tunnel</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>WireDogTunnel</string>
+    <key>CFBundlePackageType</key>
+    <string>SYSX</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.12</string>
+    <key>CFBundleVersion</key>
+    <string>17</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+    <key>NSSystemExtensionUsageDescription</key>
+    <string>WireDog VPN needs to install a system extension to create a secure VPN tunnel.</string>
+    <key>NetworkExtension</key>
+    <dict>
+        <key>NEMachServiceName</key>
+        <string>group.com.wiredog.vpn.macos</string>
+        <key>NEProviderClasses</key>
+        <dict>
+            <key>com.apple.networkextension.packet-tunnel</key>
+            <string>$(PRODUCT_MODULE_NAME).PacketTunnelProvider</string>
+        </dict>
+    </dict>
+</dict>
+</plist>

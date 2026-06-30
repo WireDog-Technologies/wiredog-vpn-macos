@@ -1,0 +1,50 @@
+# xcodegen project spec for WireDog VPN macOS main app
+# Generate the Xcode project with: xcodegen generate
+#
+# Prerequisites:
+#   brew install xcodegen
+#
+# This generates WireDog.xcodeproj for the main app target
+# with proper entitlements and code signing configuration.
+
+name: WireDog
+options:
+  bundleIdPrefix: com.wiredog.vpn
+  deploymentTarget:
+    macOS: "12.0"
+  xcodeVersion: "15.0"
+  generateEmptyDirectories: true
+
+targets:
+  WireDog VPN:
+    type: application
+    platform: macOS
+    deploymentTarget: "12.0"
+    sources:
+      - path: electron
+        includes:
+          - "**/*"
+      - path: native/src
+        includes:
+          - "*.mm"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.wiredog.vpn.macos
+        PRODUCT_NAME: "WireDog VPN"
+        INFOPLIST_FILE: ""
+        CODE_SIGN_ENTITLEMENTS: entitlements.mac.plist
+        MACOSX_DEPLOYMENT_TARGET: "12.0"
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: "YOUR_TEAM_ID"
+        ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_IDENTITY: "Apple Development"
+    entitlements:
+      path: entitlements.mac.plist
+
+schemes:
+  WireDog VPN:
+    build:
+      targets:
+        WireDog VPN: all
+    archive:
+      config: Release

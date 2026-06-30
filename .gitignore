@@ -1,0 +1,61 @@
+# Internal dev tooling — not needed by contributors
+.claude/
+CLAUDE.md
+todo.md
+tasks/
+docs/
+
+# Build-generated secrets
+.env.build
+
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+out/
+build/
+*.node
+release/
+
+# Native addon
+native/build/
+native/prebuilds/
+
+# Swift
+.build/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+xcuserdata/
+*.xcuserstate
+DerivedData/
+# Generated Xcode project (regenerate with: cd extension && xcodegen generate)
+extension/WireDogTunnel.xcodeproj/
+# SPM package cache
+.swiftpm/
+
+# Vite
+.vite/
+
+# Environment
+.env
+.env.*
+!.env.local.example
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
+
+# Electron
+*.dmg
+*.zip

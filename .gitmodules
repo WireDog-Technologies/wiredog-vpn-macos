@@ -1,0 +1,4 @@
+[submodule "extension/wireguard-apple"]
+	path = extension/wireguard-apple
+	url = https://github.com/rjscruggs/wireguard-apple.git
+	branch = wiredog-fixes

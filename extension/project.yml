@@ -1,0 +1,99 @@
+# xcodegen project spec for WireDogTunnel Network Extension
+# Generate the Xcode project with: cd extension && xcodegen generate
+#
+# Prerequisites:
+#   brew install xcodegen
+#
+# This generates WireDogTunnel.xcodeproj with proper targets,
+# entitlements, and WireGuardKit SPM dependency.
+
+name: WireDogTunnel
+options:
+  bundleIdPrefix: com.wiredog.vpn.macos
+  deploymentTarget:
+    macOS: "12.0"
+  xcodeVersion: "15.0"
+  generateEmptyDirectories: true
+
+packages:
+  WireGuardKit:
+    path: wireguard-apple
+
+targets:
+  WireDogTunnel:
+    type: system-extension
+    platform: macOS
+    deploymentTarget: "12.0"
+    sources:
+      - path: WireDogTunnel
+        includes:
+          - "*.swift"
+    dependencies:
+      - package: WireGuardKit
+        product: WireGuardKit
+      - framework: NetworkExtension.framework
+        embed: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.wiredog.vpn.macos.tunnel
+        PRODUCT_NAME: "$(PRODUCT_BUNDLE_IDENTIFIER)"
+        MACH_O_TYPE: mh_execute
+        INFOPLIST_FILE: WireDogTunnel/Info.plist
+        CODE_SIGN_ENTITLEMENTS: WireDogTunnel/WireDogTunnel.entitlements
+        SWIFT_VERSION: "5.9"
+        MACOSX_DEPLOYMENT_TARGET: "12.0"
+        CODE_SIGN_STYLE: Manual
+        DEVELOPMENT_TEAM: YOUR_TEAM_ID
+        # System extensions are signed with Developer ID Application, not team cert
+        CODE_SIGN_IDENTITY: "Developer ID Application"
+        ENABLE_HARDENED_RUNTIME: YES
+        SKIP_INSTALL: YES
+        # System extension runtime search paths
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks @executable_path/../../../../Frameworks"
+        # WireGuardKitGo library search path
+        LIBRARY_SEARCH_PATHS: "$(inherited) $(SRCROOT)/wireguard-apple/Sources/WireGuardKitGo/out"
+
+  WireDogFilter:
+    type: app-extension
+    platform: macOS
+    deploymentTarget: "12.0"
+    sources:
+      - path: WireDogFilter
+        includes:
+          - "*.swift"
+    dependencies:
+      - framework: NetworkExtension.framework
+        embed: false
+      - framework: Network.framework
+        embed: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.wiredog.vpn.macos.filter
+        PRODUCT_NAME: WireDogFilter
+        MACH_O_TYPE: mh_execute
+        INFOPLIST_FILE: WireDogFilter/Info.plist
+        CODE_SIGN_ENTITLEMENTS: WireDogFilter/WireDogFilter.entitlements
+        SWIFT_VERSION: "5.9"
+        MACOSX_DEPLOYMENT_TARGET: "12.0"
+        CODE_SIGN_STYLE: Manual
+        DEVELOPMENT_TEAM: YOUR_TEAM_ID
+        CODE_SIGN_IDENTITY: "Apple Development"
+        PROVISIONING_PROFILE_SPECIFIER: "WireDog macOS Filter"
+        ENABLE_HARDENED_RUNTIME: YES
+        SKIP_INSTALL: YES
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks @executable_path/../../../../Frameworks"
+
+schemes:
+  WireDogTunnel:
+    build:
+      targets:
+        WireDogTunnel: all
+    archive:
+      config: Release
+
+  WireDogFilter:
+    build:
+      targets:
+        WireDogFilter: all
+    archive:
+      config: Release

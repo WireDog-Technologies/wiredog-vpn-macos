@@ -1,0 +1,109 @@
+{
+  "$schema": "https://raw.githubusercontent.com/electron-userland/electron-builder/master/packages/app-builder-lib/scheme.json",
+  "appId": "com.wiredog.vpn.macos",
+  "productName": "WireDog VPN",
+  "directories": {
+    "output": "release"
+  },
+  "files": [
+    "dist/**/*",
+    "electron/**/*",
+    "!node_modules/**/*",
+    "node_modules/**/*"
+  ],
+  "extraResources": [
+    {
+      "from": "native/build/Release/wiredog_native.node",
+      "to": "native/wiredog_native.node"
+    },
+    {
+      "from": "native/build/Release/libWireDogNative.dylib",
+      "to": "native/libWireDogNative.dylib"
+    },
+    {
+      "from": "native-sysext/build/Release/wiredog_sysext.node",
+      "to": "sysext/wiredog_sysext.node"
+    },
+    {
+      "from": "helper/build/wiredog-helper",
+      "to": "helper/wiredog-helper"
+    },
+    {
+      "from": "helper/Info.plist",
+      "to": "helper/Info.plist"
+    },
+    {
+      "from": "helper/com.wiredog.vpn.helper.plist",
+      "to": "helper/com.wiredog.vpn.helper.plist"
+    },
+    {
+      "from": "helper/install-helper.sh",
+      "to": "helper/install-helper.sh"
+    },
+    {
+      "from": "scripts/install-update.sh",
+      "to": "install-update.sh"
+    },
+    {
+      "from": "build/tray-icon.png",
+      "to": "tray-icon.png"
+    },
+    {
+      "from": "build/tray-connected.png",
+      "to": "tray-connected.png"
+    },
+    {
+      "from": "build/tray-disconnected.png",
+      "to": "tray-disconnected.png"
+    }
+  ],
+  "extraFiles": [
+    {
+      "from": "extension/build/com.wiredog.vpn.macos.tunnel.systemextension",
+      "to": "Library/SystemExtensions/com.wiredog.vpn.macos.tunnel.systemextension"
+    },
+    {
+      "from": "extension/build/WireDogFilter.appex",
+      "to": "PlugIns/WireDogFilter.appex"
+    },
+    {
+      "from": "sysext-activator/build/WireDogActivator",
+      "to": "MacOS/WireDogActivator"
+    }
+  ],
+  "mac": {
+    "target": [
+      { "target": "dmg", "arch": ["arm64"] },
+      { "target": "zip", "arch": ["arm64"] }
+    ],
+    "publish": {
+      "provider": "generic",
+      "url": "https://updates.wiredogvpn.com/macos"
+    },
+    "category": "public.app-category.utilities",
+    "icon": "build/icon.icns",
+    "hardenedRuntime": true,
+    "gatekeeperAssess": false,
+    "notarize": false,
+    "identity": "Developer ID Application",
+    "entitlements": "entitlements.mac.plist",
+    "entitlementsInherit": "entitlements.mac.inherit.plist",
+    "signIgnore": ["com\\.wiredog\\.vpn\\.macos\\.tunnel\\.systemextension", "WireDogFilter\\.appex", "wiredog-helper", "WireDogActivator", "com\\.wiredog\\.vpn\\.macos\\.config\\.xpc"],
+    "extendInfo": {
+      "NSSystemExtensionUsageDescription": "WireDog VPN needs to install a system extension to create a secure VPN tunnel."
+    }
+  },
+  "artifactName": "WireDog-VPN-${version}-${arch}.${ext}",
+  "dmg": {
+    "contents": [
+      { "x": 130, "y": 220 },
+      { "x": 410, "y": 220, "type": "link", "path": "/Applications" }
+    ],
+    "background": "build/background.png",
+    "icon": "build/icon.icns",
+    "iconSize": 100,
+    "window": { "width": 540, "height": 380 }
+  },
+  "afterPack": "afterpack.js",
+  "afterSign": "notarize.js"
+}
