@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  wiredog-helper is a bare (non-bundle) Mach-O executable run as a root LaunchDaemon.
+  It must claim NO entitlements here at all — not just no restricted ones.
+
+  Confirmed empirically (VPN_CONNECTION_DEBUG.md Session 10): even
+  com.apple.application-identifier / com.apple.developer.team-identifier alone (with
+  zero restricted capability entitlements) caused taskgated-helper to reject every
+  exec() attempt with "no eligible provisioning profiles found" (AMFI Code=-413). For a
+  process launchd spawns as a root daemon, merely declaring an App ID makes AMFI require
+  a matching provisioning profile — which, per Apple's own docs, a bare executable can
+  never have. Signing this binary with a fully empty entitlements dict (as below) is what
+  actually lets it exec on a clean machine. Do not add any entitlement here without
+  re-testing on a genuinely clean machine first.
+-->
+<dict/>
+</plist>

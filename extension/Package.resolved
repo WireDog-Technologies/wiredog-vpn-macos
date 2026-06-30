@@ -1,0 +1,14 @@
+{
+  "pins" : [
+    {
+      "identity" : "amneziawg-apple",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/amnezia-vpn/amneziawg-apple",
+      "state" : {
+        "revision" : "5cbc86f38466ff763e24167bebc2640d6c30e7fe",
+        "version" : "2.0.1"
+      }
+    }
+  ],
+  "version" : 2
+}
