@@ -31,7 +31,7 @@ class JsonRpcHandler {
         switch method {
         case "ping":
             reply(successResponse(id: id, result: [
-                "version": "1.0.0",
+                "version": HelperVersion.current,
                 "uptime": ProcessInfo.processInfo.systemUptime
             ]))
 

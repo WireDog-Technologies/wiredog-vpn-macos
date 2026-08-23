@@ -9,6 +9,27 @@ const log = require('electron-log');
 const serviceClient = require('../ipc/service-client');
 const { buildAllowedIPs } = require('../utils/cidrUtils');
 
+// Thrown when a connect() attempt is aborted via cancelConnect() (user tapped Connect again
+// while connecting/reconnecting). Distinguished from a real failure so callers can skip
+// surfacing an error toast for it — mirrors iOS's VPNError.cancelled.
+class ConnectCancelledError extends Error {
+  constructor() {
+    super('Connection cancelled');
+    this.name = 'ConnectCancelledError';
+  }
+}
+
+// Thrown when /vpn/connect rejects the auth token (expired/invalid). Distinguished by a
+// fixed sentinel message so the renderer can detect it across the IPC boundary (only
+// message/name/stack survive electron's ipcRenderer.invoke error serialization) and route
+// the user back to login instead of leaving them stuck on a raw "Invalid token" toast.
+class UnauthorizedError extends Error {
+  constructor() {
+    super('WIREDOG_UNAUTHORIZED');
+    this.name = 'UnauthorizedError';
+  }
+}
+
 // Extract the UDP port from an endpoint string like "1.2.3.4:443" or "host:443".
 function extractEndpointPort(endpoint) {
   const str = (endpoint || '').trim();
@@ -81,6 +102,27 @@ class VPNService {
     this._intentionalDisconnect = false; // true while disconnect() is in progress
     this._extensionApprovalCallback = null; // fired when extension is in activated_waiting_for_user
     this._tunnelManagerLoading = false;
+    this._getAuthToken = null; // injected from main.js — () => decrypted auth token string
+
+    // --- Connection-counter bookkeeping (mirrors iOS VPNService.swift) ---
+    this.currentServerId = null;
+    this.userInitiatedDisconnect = false; // persists across the whole disconnected period, unlike _intentionalDisconnect
+    this.isReconnecting = false;
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = 10;
+    this.reconnectBaseDelay = 1.0; // seconds
+    this.reconnectMaxDelay = 15.0; // seconds
+    this.minimumStableConnectionDuration = 30; // seconds — a connection that drops before this never really established
+    this.disconnectNotifyDelayMs = 1500; // time for tunnel to fully stop before notifying backend
+    this.connectedSince = null;
+    this._reconnectTimer = null;
+    // Cooperative cancellation token for whichever connect() call is currently in flight
+    // (either a first attempt or an auto-reconnect retry) — set by cancelConnect().
+    this._connectAbortToken = null;
+    // Guards against firing two concurrent /disconnect calls for the same session (e.g. a
+    // crash-recovery retry and a foreground retry landing close together).
+    this.sessionsPendingCleanup = new Set();
+    this.hasHandledFirstFocusEvent = false;
 
     log.info('VPN Service initialized (macOS)');
     log.info('API Base URL:', this.apiBaseUrl);
@@ -119,6 +161,107 @@ class VPNService {
     }
   }
 
+  /**
+   * Inject a function that returns the current (decrypted) auth token. Needed because
+   * auto-reconnect and pending-disconnect retries originate from inside VPNService itself,
+   * not from an IPC call that already carries a token from the renderer.
+   */
+  setAuthTokenProvider(fn) {
+    this._getAuthToken = fn;
+  }
+
+  // --- Pending-disconnect ledger (mirrors iOS's UserDefaults-backed pendingDisconnectIds) ---
+  // A sessionId is written here *before* the network call is attempted, and only removed on
+  // confirmed success, so a disconnect lost to a network blip / offline app survives to be
+  // retried on next launch or foreground instead of leaking the backend counter forever.
+
+  _pendingDisconnectIds() {
+    if (!this.configStore) return [];
+    return this.configStore.get('pendingDisconnectIds', []);
+  }
+
+  _addPendingDisconnect(sessionId) {
+    if (!this.configStore) return;
+    const ids = new Set(this._pendingDisconnectIds());
+    ids.add(sessionId);
+    this.configStore.set('pendingDisconnectIds', Array.from(ids));
+  }
+
+  _removePendingDisconnect(sessionId) {
+    if (!this.configStore) return;
+    const ids = new Set(this._pendingDisconnectIds());
+    ids.delete(sessionId);
+    this.configStore.set('pendingDisconnectIds', Array.from(ids));
+  }
+
+  /**
+   * Best-effort notification to the backend that a session is no longer valid, so its
+   * device-count slot is released. This is the single choke point every code path that could
+   * leave a claimed-but-unreleased session routes through — mirrors iOS's cleanupOrphanedSession.
+   *
+   * The sessionId is persisted to the durable pending list *before* the network call, and only
+   * removed on confirmed success — if the app has no connectivity right now, the call fails
+   * silently, but the record survives so retryPendingDisconnects() can retry it later instead of
+   * leaking the counter forever. The backend's /disconnect is NOT idempotent (unconditionally
+   * decrements on every valid call), so sessionsPendingCleanup guards against firing two
+   * concurrent calls for the same session.
+   */
+  cleanupOrphanedSession(sessionId, reason) {
+    if (this.sessionsPendingCleanup.has(sessionId)) return;
+    this.sessionsPendingCleanup.add(sessionId);
+
+    log.info(`VPN: cleaning up orphaned session (${reason})`);
+    this._addPendingDisconnect(sessionId);
+
+    setTimeout(async () => {
+      try {
+        const token = this._getAuthToken ? this._getAuthToken() : '';
+        const headers = { 'Content-Type': 'application/json' };
+        if (token) headers['Authorization'] = `Bearer ${token}`;
+        const response = await fetch(`${this.apiBaseUrl}/vpn/disconnect`, {
+          method: 'POST',
+          headers,
+          credentials: 'include',
+          body: JSON.stringify({ sessionId }),
+        });
+        if (response.ok) {
+          this._removePendingDisconnect(sessionId);
+        }
+        // Non-ok: left in the pending list, retried via retryPendingDisconnects() later.
+      } catch (err) {
+        log.warn('VPN: cleanupOrphanedSession disconnect failed (will retry):', err.message);
+        // Left in the pending list — retried via retryPendingDisconnects() later.
+      } finally {
+        this.sessionsPendingCleanup.delete(sessionId);
+      }
+    }, this.disconnectNotifyDelayMs);
+  }
+
+  /**
+   * Retries any /disconnect calls that were owed but never confirmed — e.g. the app had no
+   * connectivity right as cleanupOrphanedSession()'s call went out, so nothing ever reached
+   * the backend. Safe to call unconditionally: each retry goes through cleanupOrphanedSession()'s
+   * own in-flight guard.
+   */
+  retryPendingDisconnects() {
+    for (const sessionId of this._pendingDisconnectIds()) {
+      this.cleanupOrphanedSession(sessionId, 'retrying pending disconnect from previous launch');
+    }
+  }
+
+  /**
+   * Called when the app returns to the foreground (window focus). Mirrors iOS's
+   * willEnterForeground handler: its very first firing coincides with the cold-start retry
+   * initialize() already performs, so it's skipped there in favor of that one.
+   */
+  handleAppForeground() {
+    if (this.hasHandledFirstFocusEvent) {
+      this.retryPendingDisconnects();
+    } else {
+      this.hasHandledFirstFocusEvent = true;
+    }
+  }
+
   _persistLastConnectionConfig() {
     if (!this.configStore) return;
     try {
@@ -150,6 +293,10 @@ class VPNService {
    * for tunnel status notifications.
    */
   async initialize() {
+    // Retry any /disconnect calls that were owed but never confirmed from a previous launch —
+    // independent of helper/tunnel-manager availability below, this is a pure HTTP call against
+    // the durable pending-disconnect ledger. Mirrors iOS's loadVPNManager() cold-start retry.
+    this.retryPendingDisconnects();
 
     // Check if helper daemon is installed
     // Helper binary lives inside the app bundle so Bundle.main resolves to the Electron app
@@ -209,29 +356,11 @@ class VPNService {
               log.info('VPN: Startup crash recovery — cleaning up stale session %s',
                 this.lastConnectionConfig.sessionId);
 
-              // Read and decrypt the auth token from the config store
-              let authToken = null;
-              if (this.configStore) {
-                const stored = this.configStore.get('authToken');
-                if (stored) {
-                  try {
-                    authToken = safeStorage.isEncryptionAvailable()
-                      ? safeStorage.decryptString(Buffer.from(stored, 'base64'))
-                      : stored;
-                  } catch { /* proceed without auth token */ }
-                }
-              }
-
-              const headers = { 'Content-Type': 'application/json' };
-              if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
-
-              // Fire-and-forget — don't block startup on this
-              fetch(`${this.apiBaseUrl}/vpn/disconnect`, {
-                method: 'POST',
-                headers,
-                body: JSON.stringify({ sessionId: this.lastConnectionConfig.sessionId }),
-                signal: AbortSignal.timeout(5000),
-              }).catch(err => log.warn('VPN: Startup crash recovery disconnect failed:', err.message));
+              // Durable cleanup — if this fails (no connectivity yet at cold start), the
+              // sessionId survives in the pending-disconnect ledger and gets retried by
+              // retryPendingDisconnects() on a later launch/foreground instead of being
+              // forgotten outright.
+              this.cleanupOrphanedSession(this.lastConnectionConfig.sessionId, 'crash recovery — stale session');
 
               // Clear the stale sessionId but preserve the WireGuard config
               // so the kill-switch persistent-block reconnect path can still use it
@@ -494,6 +623,9 @@ class VPNService {
   restoreSession(savedSession) {
     if (!this.currentSession && savedSession) {
       this.currentSession = savedSession;
+      // Needed so an unexpected drop after a restart-while-connected can still auto-reconnect
+      // (see _attemptReconnect, which reconnects by currentServerId).
+      this.currentServerId = savedSession.server?.id ?? savedSession.server?.serverId ?? null;
       log.info('VPN: Restored session from saved state');
     }
   }
@@ -504,6 +636,12 @@ class VPNService {
   async connect(serverId, settings, token = '') {
     log.info(`VPN: Connect request to server ${serverId}`);
     this.settings = settings;
+
+    // Cooperative cancellation token for this specific attempt — cancelConnect() flips
+    // .cancelled on whatever token is current; checked at the same two checkpoints iOS uses
+    // (right before and right after starting the tunnel).
+    const abortToken = { cancelled: false };
+    this._connectAbortToken = abortToken;
 
     // Helper daemon is required for tunnel operations
     const available = await this.ensureHelperAvailable();
@@ -519,10 +657,19 @@ class VPNService {
     // Ensure system extension is activated and tunnel manager is loaded
     await this.ensureExtensionActive();
 
-    try {
-      let config, sessionId, server;
-      let usedCachedConfig = false;
+    this.connectedSince = null;
+    if (!this.isReconnecting) {
+      this.userInitiatedDisconnect = false;
+      this.reconnectAttempts = 0;
+    }
 
+    // Declared outside the try block so the catch clause below can see whether a sessionId
+    // was already claimed from the backend (and thus already incremented the counter) before
+    // something later in this function threw.
+    let config, sessionId, server;
+    let usedCachedConfig = false;
+
+    try {
       // If we're in persistentBlock with cached config for this same server,
       // skip the API call (it would be blocked by pf rules anyway) and reuse
       // the cached WireGuard config. Matches Windows auto-reconnect behavior.
@@ -538,6 +685,7 @@ class VPNService {
         sessionId = cached.sessionId;
         server = cached.server;
         usedCachedConfig = true;
+        this.currentServerId = serverId;
       } else {
         // Fetch connection config from backend API
         log.info('VPN: Fetching connection config from backend...');
@@ -557,7 +705,12 @@ class VPNService {
             method: 'POST',
             headers,
             credentials: 'include',
-            body: JSON.stringify({ serverId, localMode: settings.localMode || false }),
+            body: JSON.stringify({
+              serverId,
+              localMode: settings.localMode || false,
+              blockAds: settings.blockAdsEnabled ?? true,
+              blockMalware: settings.blockMalwareEnabled ?? true,
+            }),
             signal: controller.signal,
           });
         } catch (err) {
@@ -571,11 +724,20 @@ class VPNService {
 
         if (!response.ok) {
           const error = await response.json().catch(() => ({ error: 'Unknown error' }));
+          // The backend reuses 429 for the 5-device connection cap (the only source of 429 on
+          // this endpoint) — surface a clean, actionable message instead of the raw backend text.
+          if (response.status === 429 && error.error?.includes('Connection limit exceeded')) {
+            throw new Error("You've reached your 5-device limit. Disconnect another device to continue.");
+          }
+          if (response.status === 401) {
+            throw new UnauthorizedError();
+          }
           throw new Error(error.error || `API error: ${response.status}`);
         }
 
         const responseData = await response.json();
         ({ config, sessionId, server } = responseData);
+        this.currentServerId = serverId;
 
         log.info('VPN: Received connection config');
         log.info('VPN: Server location:', server?.city ? `${server.city}, ${server.stateCode || ''}` : 'unknown');
@@ -664,6 +826,11 @@ class VPNService {
         awg.Jc ?? 'nil', awg.Jmin ?? 'nil', awg.Jmax ?? 'nil', awg.S1 ?? 'nil', awg.S2 ?? 'nil',
         awg.H1 ?? 'nil', awg.H2 ?? 'nil', awg.H3 ?? 'nil', awg.H4 ?? 'nil');
       log.info('VPN: endpoint=%s dns=%s address=%s allowedIPs=%s', config.endpoint, config.dns, config.address, allowedIPs);
+
+      // A cancel (tap-again-to-cancel) may have arrived while awaiting everything above —
+      // check before starting the tunnel, mirroring iOS's Task.checkCancellation().
+      if (abortToken.cancelled) throw new ConnectCancelledError();
+
       await tunnelAddon.startTunnel({
         privateKey: config.privateKey,
         address: config.address,
@@ -684,6 +851,13 @@ class VPNService {
         awgH3: awg.H3,
         awgH4: awg.H4,
       });
+
+      // The tunnel just started — if a cancel landed in the narrow window right around this
+      // call, tear it back down immediately rather than leaving an untracked live tunnel.
+      if (abortToken.cancelled) {
+        tunnelAddon.stopTunnel();
+        throw new ConnectCancelledError();
+      }
 
       // Kill switch connected-state transition (status notification will also trigger this)
       if (settings.killSwitch && this.helperConnected) {
@@ -727,7 +901,12 @@ class VPNService {
           method: 'POST',
           headers,
           credentials: 'include',
-          body: JSON.stringify({ serverId, localMode: settings.localMode || false })
+          body: JSON.stringify({
+            serverId,
+            localMode: settings.localMode || false,
+            blockAds: settings.blockAdsEnabled ?? true,
+            blockMalware: settings.blockMalwareEnabled ?? true,
+          })
         })
           .then(resp => resp.ok
             ? resp.json().then(data => {
@@ -743,8 +922,55 @@ class VPNService {
       return this.currentSession;
 
     } catch (error) {
-      log.error('VPN: Connection failed:', error);
+      if (error instanceof ConnectCancelledError) {
+        // User-initiated cancel (tap-again-to-cancel) — expected, not a failure.
+        log.info('VPN: Connect cancelled');
+      } else if (error instanceof UnauthorizedError) {
+        log.warn('VPN: Connect failed — auth token rejected by backend (expired or invalid)');
+      } else {
+        log.error('VPN: Connection failed:', error);
+      }
+      // If we obtained a sessionId from a *fresh* /vpn/connect call (thus incrementing the
+      // backend's device counter) before something later in this function failed, release it —
+      // mirrors iOS's cleanupLeakedSessionIfNeeded(). Scoped to the non-cached path only: in the
+      // persistentBlock cached-config-reuse path, sessionId came from an already-tracked session
+      // rather than a fresh claim, so there is nothing new here to release.
+      if (sessionId && !usedCachedConfig) {
+        this.cleanupOrphanedSession(sessionId, 'connect() threw after sessionId obtained');
+        if (!this.isReconnecting) {
+          this.currentServerId = null;
+        }
+      }
       throw error;
+    }
+  }
+
+  /**
+   * Cancels an in-progress connect() — either a first attempt (still awaiting the backend or
+   * the tunnel starting) or an in-progress auto-reconnect loop (backoff wait or an active retry
+   * attempt). Mirrors iOS's cancelConnect()/VPNManager.cancelConnect() split, collapsed into one
+   * method since macOS has no separate caller-owned Task to cancel independently.
+   */
+  cancelConnect() {
+    log.info('VPN: Cancel connect requested');
+
+    // Flips whichever connect() call is currently in flight (first attempt or an active
+    // reconnect retry) — checked cooperatively at the two checkpoints inside connect().
+    if (this._connectAbortToken) {
+      this._connectAbortToken.cancelled = true;
+    }
+
+    if (this.isReconnecting) {
+      this.userInitiatedDisconnect = true;
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+      this.isReconnecting = false;
+      this.reconnectAttempts = 0;
+      // A previous retry may have already claimed a session (and thus incremented the counter)
+      // before this cancel arrived — release it so the counter stays net-zero.
+      if (this.currentSession?.sessionId) {
+        this.disconnect().catch(err => log.warn('VPN: cancelConnect disconnect failed:', err.message));
+      }
     }
   }
 
@@ -753,6 +979,18 @@ class VPNService {
    */
   async disconnect(token = '', disableProtection = true) {
     log.info(`VPN: Disconnect request (disableProtection=${disableProtection})`);
+
+    // Persists across the whole disconnected period (unlike _intentionalDisconnect, which is
+    // reset in the finally block below) so a status notification arriving after disconnect()
+    // has already returned is still correctly recognized as user-initiated, not an unexpected
+    // drop — mirrors iOS's userInitiatedDisconnect, only reset at the start of the next connect().
+    this.userInitiatedDisconnect = true;
+    clearTimeout(this._reconnectTimer);
+    this._reconnectTimer = null;
+    this.isReconnecting = false;
+    this.reconnectAttempts = 0;
+    this.currentServerId = null;
+    this.connectedSince = null;
 
     this._intentionalDisconnect = true;
     try {
@@ -783,22 +1021,10 @@ class VPNService {
         }
       }
 
-      // Notify backend
+      // Notify backend — durable cleanup (persisted + retried on failure) rather than a bare
+      // fire-and-forget fetch, so a disconnect lost to a network blip doesn't leak the counter.
       if (this.currentSession) {
-        try {
-          const headers = { 'Content-Type': 'application/json' };
-          if (token) {
-            headers['Authorization'] = `Bearer ${token}`;
-          }
-          await fetch(`${this.apiBaseUrl}/vpn/disconnect`, {
-            method: 'POST',
-            headers,
-            credentials: 'include',
-            body: JSON.stringify({ sessionId: this.currentSession.sessionId })
-          });
-        } catch (apiError) {
-          log.warn('VPN: Failed to notify backend of disconnect:', apiError);
-        }
+        this.cleanupOrphanedSession(this.currentSession.sessionId, 'user-initiated disconnect');
       }
 
       this.currentSession = null;
@@ -850,6 +1076,13 @@ class VPNService {
         status = this.currentSession ? 'connected' : 'disconnected';
       }
 
+      // During an auto-reconnect backoff wait, the tunnel is genuinely down (no session, no
+      // native transition) so the mapping above reports 'disconnected' — override so the UI
+      // shows the same in-progress affordance (and cancel button) as a first connect attempt.
+      if (this.isReconnecting) {
+        status = 'connecting';
+      }
+
       // Query helper daemon for kill switch state
       if (this.helperConnected) {
         try {
@@ -867,15 +1100,17 @@ class VPNService {
         session: this.currentSession,
         killSwitchEnabled,
         advancedKillSwitchEnabled,
-        advancedKillSwitchActive
+        advancedKillSwitchActive,
+        isReconnecting: this.isReconnecting
       };
     } catch (error) {
       return {
-        status: 'disconnected',
+        status: this.isReconnecting ? 'connecting' : 'disconnected',
         session: this.currentSession,
         killSwitchEnabled: false,
         advancedKillSwitchEnabled: false,
-        advancedKillSwitchActive: false
+        advancedKillSwitchActive: false,
+        isReconnecting: this.isReconnecting
       };
     }
   }
@@ -943,6 +1178,16 @@ class VPNService {
       }
       this.settings.killSwitch = false;
       this.settings.permanentKillSwitch = false;
+      this.userInitiatedDisconnect = true;
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+      this.isReconnecting = false;
+      this.reconnectAttempts = 0;
+      this.currentServerId = null;
+      this.connectedSince = null;
+      if (this.currentSession) {
+        this.cleanupOrphanedSession(this.currentSession.sessionId, 'emergency reset');
+      }
       this.currentSession = null;
       this.lastConnectionConfig = null;
       this._persistLastConnectionConfig();
@@ -1103,12 +1348,41 @@ class VPNService {
   _handleTunnelStatusChange(status) {
     log.info('VPN: Tunnel status changed:', status);
 
+    if (status === 'connected') {
+      this.connectedSince = Date.now();
+      this.isReconnecting = false;
+      this.reconnectAttempts = 0;
+    }
+
     // If the tunnel disconnects while a session is active and we didn't call disconnect()
-    // ourselves, the tunnel dropped unexpectedly. Clear the session so getFullStatus()
-    // returns a consistent disconnected state instead of stale connected data.
-    if (status === 'disconnected' && this.currentSession && !this._intentionalDisconnect) {
+    // ourselves, the tunnel dropped unexpectedly — mirrors iOS's updateConnectionState().
+    if (status === 'disconnected' && this.currentSession && !this._intentionalDisconnect && !this.userInitiatedDisconnect) {
       log.info('VPN: Unexpected tunnel disconnect — clearing stale session');
+
+      const staleSessionId = this.currentSession.sessionId;
+      const serverId = this.currentServerId;
+      const wasStable = this.connectedSince != null &&
+        (Date.now() - this.connectedSince) >= this.minimumStableConnectionDuration * 1000;
+
+      // Connection never proved itself stable — clean up its slot rather than letting the
+      // upcoming reconnect attempt leak another increment on top of this orphaned one.
+      // (A connection that *was* stable and then drops is not cleaned up here — the reconnect
+      // attempt below claims a brand-new session instead. This mirrors iOS exactly, including
+      // its own known gap: that old session's slot is only reclaimed via the backend's manual
+      // /vpn/reset-connections escape hatch, not automatically.)
+      if (!wasStable && staleSessionId) {
+        this.cleanupOrphanedSession(
+          staleSessionId,
+          `dropped before ${this.minimumStableConnectionDuration}s stability threshold`
+        );
+      }
+
       this.currentSession = null;
+      this.connectedSince = null;
+
+      if (serverId) {
+        this._attemptReconnect(serverId);
+      }
     }
 
     // While disconnect() is in progress, suppress NE notifications entirely.
@@ -1147,10 +1421,60 @@ class VPNService {
   }
 
   /**
+   * Auto-reconnect after an unexpected tunnel drop. Mirrors iOS's attemptReconnect(): exponential
+   * backoff with jitter (1s, 2s, 4s, 8s, 15s max by default), up to maxReconnectAttempts, using
+   * the same server/settings as the connection that just dropped.
+   */
+  _attemptReconnect(serverId) {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      this.isReconnecting = false;
+      log.error(`VPN: Reconnection failed after ${this.maxReconnectAttempts} attempts`);
+      if (this.currentSession?.sessionId) {
+        this.cleanupOrphanedSession(this.currentSession.sessionId, 'reconnect attempts exhausted');
+      }
+      this.currentServerId = null;
+      this.notifyStatusChange();
+      return;
+    }
+
+    this.isReconnecting = true;
+    this.reconnectAttempts += 1;
+    log.warn(`VPN: Auto-reconnect attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts}`);
+
+    const baseDelay = Math.min(
+      this.reconnectBaseDelay * Math.pow(2, this.reconnectAttempts - 1),
+      this.reconnectMaxDelay
+    );
+    const jitterFactor = 0.5 + Math.random(); // 0.5..1.5
+    const delay = baseDelay * jitterFactor;
+
+    clearTimeout(this._reconnectTimer);
+    this._reconnectTimer = setTimeout(async () => {
+      if (this.userInitiatedDisconnect) return;
+      try {
+        const token = this._getAuthToken ? this._getAuthToken() : '';
+        await this.connect(serverId, this.settings, token);
+      } catch (err) {
+        // Will retry via _handleTunnelStatusChange when a further disconnect is detected,
+        // same as iOS — connect() above has already released any session it leaked.
+        log.warn(`VPN: Reconnect attempt ${this.reconnectAttempts} failed: ${err.message}`);
+      }
+    }, delay);
+  }
+
+  /**
    * Cleanup on shutdown
    */
   async cleanup() {
     log.info('VPN: Cleanup on shutdown');
+
+    // Persist the sessionId to the pending-disconnect ledger so it survives even if the process
+    // exits before cleanupOrphanedSession's own delayed network attempt gets to run — the actual
+    // decrement then happens via retryPendingDisconnects() on the next launch, same as how iOS
+    // relies on next-launch crash recovery for an unclean quit it can't otherwise intercept.
+    if (this.currentSession) {
+      this.cleanupOrphanedSession(this.currentSession.sessionId, 'app quit');
+    }
 
     try {
       const addon = this._getNativeAddon();

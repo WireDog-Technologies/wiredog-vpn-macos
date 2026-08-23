@@ -10,6 +10,16 @@
 #   bash scripts/build-production.sh --notarize          # signed + notarized
 #   bash scripts/build-production.sh --config            # print config and exit
 #   bash scripts/build-production.sh --local --verbose   # detailed logging
+#   bash scripts/build-production.sh --local --integration   # same build, bakes in
+#                                                              # .env.development (integration
+#                                                              # backend/frontend) instead of
+#                                                              # .env.production — mirrors iOS's
+#                                                              # Debug config. Still fully signed;
+#                                                              # only the baked API/frontend URLs
+#                                                              # differ. Output DMG/ZIP filenames
+#                                                              # get a "-Test" suffix so they're
+#                                                              # never confused with a real release
+#                                                              # sitting in release/.
 #
 # Notarization env vars (required with --notarize):
 #   APPLE_ID                         Apple Developer account email
@@ -56,16 +66,18 @@ LOCAL=0
 NOTARIZE=0
 CONFIG_ONLY=0
 CLEANUP=0
+INTEGRATION=0
 VERBOSE="${VERBOSE:-0}"
 SKIP_NATIVE_MODULE="${SKIP_NATIVE_MODULE:-0}"
 
 for arg in "$@"; do
   case "$arg" in
-    --local)    LOCAL=1 ;;
-    --notarize) NOTARIZE=1 ;;
-    --config)   CONFIG_ONLY=1 ;;
-    --cleanup)  CLEANUP=1 ;;
-    --verbose)  VERBOSE=1 ;;
+    --local)       LOCAL=1 ;;
+    --notarize)    NOTARIZE=1 ;;
+    --config)      CONFIG_ONLY=1 ;;
+    --cleanup)     CLEANUP=1 ;;
+    --integration) INTEGRATION=1 ;;
+    --verbose)     VERBOSE=1 ;;
     -h|--help)
       grep -E '^# ' "$0" | sed 's/^# \{0,1\}//'
       exit 0
@@ -122,6 +134,7 @@ ${C_BOLD}BUILD CONFIGURATION (Hardcoded):${C_RESET}
 
 ${C_BOLD}BUILD OPTIONS:${C_RESET}
   Mode                     : $([ "$NOTARIZE" = "1" ] && echo 'SIGNED + NOTARIZED (distribution)' || echo 'SIGNED LOCAL (no notarization)')
+  Target                   : $([ "$INTEGRATION" = "1" ] && echo 'INTEGRATION (.env.development — intapi.wiredogvpn.com)' || echo 'PRODUCTION (.env.production — api.wiredogvpn.com)')
   Skip native module       : $([ "$SKIP_NATIVE_MODULE" = "1" ] && echo 'yes' || echo 'no')
   Verbose                  : $([ "$VERBOSE" = "1" ] && echo 'yes' || echo 'no')
 
@@ -209,7 +222,8 @@ rm -rf sysext-activator/build
 rm -rf dist
 rm -rf release
 rm -f  .env.build
-ok "Cleaned: extension/build, helper/.build, native/build, sysext-activator/build, dist, release, .env.build"
+rm -f  electron/.env
+ok "Cleaned: extension/build, helper/.build, native/build, sysext-activator/build, dist, release, .env.build, electron/.env"
 
 # ============================================================================
 # Step 2: Build Network Extension
@@ -428,20 +442,46 @@ ok "WireDogActivator built (signing will be applied by afterpack.js)"
 # ============================================================================
 step "[6/9] Building React frontend (Vite)"
 
-if [ "$VERBOSE" = "1" ]; then
-  npm run build
+# --integration builds with Vite's 'development' mode, which loads .env.development
+# (integration API/frontend URLs) instead of the default 'production' mode's
+# .env.production — mirrors iOS's Config-Debug.xcconfig vs Config-Release.xcconfig.
+if [ "$INTEGRATION" = "1" ]; then
+  VITE_BUILD_CMD="npx vite build --mode development"
+  ENV_SOURCE_FILE=".env.development"
 else
-  npm run build > /tmp/wiredog-vite-build.log 2>&1 || {
+  VITE_BUILD_CMD="npm run build"
+  ENV_SOURCE_FILE=".env.production"
+fi
+[ -f "$ENV_SOURCE_FILE" ] || fail "$ENV_SOURCE_FILE not found — required to build (see .env.development / .env.production in repo root)"
+
+if [ "$VERBOSE" = "1" ]; then
+  $VITE_BUILD_CMD
+else
+  $VITE_BUILD_CMD > /tmp/wiredog-vite-build.log 2>&1 || {
     tail -40 /tmp/wiredog-vite-build.log
     fail "Vite build failed. Full log: /tmp/wiredog-vite-build.log"
   }
 fi
 
 [ -f dist/index.html ] || fail "dist/index.html not produced"
-ok "React bundle built"
+ok "React bundle built ($([ "$INTEGRATION" = "1" ] && echo integration || echo production) mode)"
 
 # ============================================================================
-# Step 6: Write .env.build for electron-builder / afterpack.js
+# Step 6b: Bake environment config for the Electron MAIN process
+# ============================================================================
+# The renderer bundle above already has its API/frontend URLs inlined by Vite at build
+# time. The Electron main process (electron/main.js, electron/vpn/index.js) is plain
+# Node.js — Vite never touches it — so without this, a packaged app's main process would
+# fall back to a hardcoded production URL regardless of which mode the renderer was built
+# with. Copying the same source file into electron/.env (included in the packaged
+# app via electron-builder.json's "electron/**/*") lets main.js load it at startup —
+# see the "Load environment config" block near the top of electron/main.js.
+step "[6b/9] Baking environment config for Electron main process"
+cp "$ENV_SOURCE_FILE" electron/.env
+ok "Baked $ENV_SOURCE_FILE -> electron/.env"
+
+# ============================================================================
+# Step 6c: Write .env.build for electron-builder / afterpack.js
 # ============================================================================
 step "[7/9] Writing .env.build and exporting signing environment"
 
@@ -477,10 +517,21 @@ fi
 # ============================================================================
 step "[8/9] Packaging Electron app (electron-builder)"
 
+# Invoked directly (not via the "package:mac" npm script) because that script does its
+# own "npm run build" first — which would silently re-run Vite in default (production)
+# mode and undo the --integration build from step 6/9 above. The frontend is already
+# built at this point, so electron-builder just needs to package what's there.
+ELECTRON_BUILDER_ARGS=(--mac)
+if [ "$INTEGRATION" = "1" ]; then
+  # Distinguishes the artifact filename from a real release sitting in release/ —
+  # same app identity/signing either way (see comment above the --integration flag).
+  ELECTRON_BUILDER_ARGS+=(-c.artifactName='WireDog-VPN-Test-${version}-${arch}.${ext}')
+fi
+
 if [ "$VERBOSE" = "1" ]; then
-  npm run package:mac
+  npx electron-builder "${ELECTRON_BUILDER_ARGS[@]}"
 else
-  npm run package:mac 2>&1 | tee /tmp/wiredog-package.log | grep -iE "(signing|notariz|afterPack|ERROR|error|building)" || true
+  npx electron-builder "${ELECTRON_BUILDER_ARGS[@]}" 2>&1 | tee /tmp/wiredog-package.log | grep -iE "(signing|notariz|afterPack|ERROR|error|building)" || true
   if [ ! -d "release/mac-arm64/WireDog VPN.app" ]; then
     tail -60 /tmp/wiredog-package.log
     fail "Packaging failed. Full log: /tmp/wiredog-package.log"
@@ -657,10 +708,11 @@ fi
 cat <<EOF
 
 ${C_GREEN}${C_BOLD}======================================
-✅ PRODUCTION BUILD COMPLETE
+✅ $([ "$INTEGRATION" = "1" ] && echo 'INTEGRATION' || echo 'PRODUCTION') BUILD COMPLETE
 ======================================${C_RESET}
 
 ${C_BOLD}BUILD CONFIGURATION:${C_RESET}
+  Target                 : $([ "$INTEGRATION" = "1" ] && echo 'INTEGRATION (intapi.wiredogvpn.com / int.wiredogvpn.com)' || echo 'PRODUCTION (api.wiredogvpn.com / wiredogvpn.com)')
   Developer ID Account   : ${DEVELOPER_ID_APPLICATION}
   Team ID                : ${APPLE_TEAM_ID}
   Apple Development Cert : ${APPLE_DEVELOPMENT_CERT_ID}
@@ -687,10 +739,12 @@ ${C_BOLD}TEST 2 VERIFICATION:${C_RESET}
   # Expected pf: bootstrap ruleset under anchor com.wiredog.vpn.
 
 ${C_BOLD}NOTES:${C_RESET}
-  - .env.build is regenerated per build (gitignored via .env.*)
+  - .env.build and electron/.env are regenerated per build (gitignored via .env.*)
   - Helper is universal (arm64 + x86_64)
   - Extension is signed with Apple Development cert (team cert, NOT Developer ID)
   - To build for distribution:  bash scripts/build-production.sh --notarize
+  - To build against integration instead of production: add --integration (same signing,
+    same app identity — only the baked API/frontend URLs differ, mirrors iOS's Debug config)
 
 ${C_GREEN}${C_BOLD}======================================${C_RESET}
 EOF

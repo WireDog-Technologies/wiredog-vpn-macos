@@ -53,9 +53,17 @@ To enable VPN capabilities:
    ```
 
 3. **Configure environment**
+
+   API/frontend URLs are already set for you via the committed `.env.development`
+   (integration — used by `npm run dev` and integration builds) and `.env.production`
+   (production — used by production builds). You don't need to touch either for normal
+   development.
+
+   `.env.local` is only needed for Apple signing/notarization credentials, or to override
+   a URL locally (e.g. pointing at a backend running on localhost):
    ```bash
    cp .env.local.example .env.local
-   # Edit .env.local and fill in your values
+   # Edit .env.local and fill in your Apple credentials (see "Production" section below)
    ```
 
 4. **Set up Xcode**
@@ -114,6 +122,21 @@ This:
 
 **Output:** `release/WireDog VPN-*.dmg` (signed, ready to install)
 
+### Building Against Integration
+
+Add `--integration` to build against the integration backend/frontend
+(`intapi.wiredogvpn.com` / `int.wiredogvpn.com`) instead of production — mirrors iOS's
+Debug vs Release config split. Same signing, same app identity as a production build;
+only the baked-in API/frontend URLs differ. The output DMG/ZIP is named
+`WireDog-VPN-Test-*` so it's never confused with a real release sitting in `release/`.
+
+```bash
+bash scripts/build-production.sh --local --integration --cleanup
+```
+
+Not side-by-side installable with a production build — same bundle ID, so installing one
+replaces the other, same as an iOS Debug build vs a TestFlight build.
+
 ### Local Testing
 
 1. Double-click the DMG to mount it
@@ -125,6 +148,10 @@ This:
 ```bash
 npm run dev        # Vite dev server + Electron (hot reload)
 ```
+
+Runs against the **integration** backend/frontend (`.env.development`) by default —
+mirrors iOS's Debug config always hitting integration. Override via `.env.local` if you
+need to point at something else (e.g. a local backend).
 
 ### Rebuilding the Network Extension
 

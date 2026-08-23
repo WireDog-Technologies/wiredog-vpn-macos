@@ -1,10 +1,11 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { User, LogOut, Hash, ChevronLeft, FileText, HistoryIcon, Bug, HelpCircle } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Separator } from '@/components/ui/separator';
 import { useVPN } from '@/context/VPNContext';
+import BlockedActionDialog from '@/components/BlockedActionDialog';
 
 const FRONTEND_URL = import.meta.env.VITE_FRONTEND_URL || 'https://wiredogvpn.com';
 
@@ -15,9 +16,14 @@ const formatBillingPeriod = (period: string): string => {
 
 const Account: React.FC = () => {
   const navigate = useNavigate();
-  const { user, logout } = useVPN();
+  const { user, connection, logout } = useVPN();
+  const [showLogoutBlockedDialog, setShowLogoutBlockedDialog] = useState(false);
 
   const handleLogout = () => {
+    if (connection.status === 'connected' || connection.status === 'connecting') {
+      setShowLogoutBlockedDialog(true);
+      return;
+    }
     logout();
     navigate('/');
   };
@@ -220,6 +226,13 @@ const Account: React.FC = () => {
           Logout
         </Button>
       </div>
+
+      <BlockedActionDialog
+        open={showLogoutBlockedDialog}
+        title="Disconnect Required"
+        message="Please disconnect the VPN before signing out."
+        onDismiss={() => setShowLogoutBlockedDialog(false)}
+      />
     </div>
   );
 };

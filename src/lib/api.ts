@@ -1,7 +1,10 @@
-// Production URL is the default; development falls back to localhost
-const API_URL = import.meta.env.MODE === 'development'
-  ? (import.meta.env.VITE_API_URL || 'http://localhost:3001/api')
-  : (import.meta.env.VITE_API_URL || 'https://api.wiredogvpn.com/api');
+import type { Announcement } from '@/types/announcements';
+
+// VITE_API_URL comes from .env.development (integration) or .env.production, selected
+// automatically by Vite's build mode — see those files for the actual values. The fallback
+// below should never be hit in practice; it defaults to production as the safe choice if it
+// somehow is.
+const API_URL = import.meta.env.VITE_API_URL || 'https://api.wiredogvpn.com/api';
 
 interface ApiError {
   message: string;
@@ -42,6 +45,15 @@ async function getHeaders(): Promise<Record<string, string>> {
 }
 
 async function handleResponse<T>(response: Response): Promise<T> {
+  // Sliding session renewal: the backend reissues a fresh token with a renewed expiry on
+  // every authenticated request, so an actively-used app never hits its token's flat TTL.
+  // Persist it whenever present, even on a non-2xx response, since the token itself was
+  // still valid to make the renewal decision.
+  const refreshedToken = response.headers.get('X-Refreshed-Token');
+  if (refreshedToken && window.electronAPI?.auth?.setToken) {
+    await window.electronAPI.auth.setToken(refreshedToken);
+  }
+
   if (!response.ok) {
     const error = await response.json().catch(() => ({ error: 'Request failed' }));
     throw { message: error.error || 'Request failed', status: response.status } as ApiError;
@@ -96,7 +108,7 @@ export async function logout(): Promise<void> {
 }
 
 export async function registerStandard(email: string, password: string, referralCode?: string): Promise<void> {
-  const body: Record<string, string> = { email, password };
+  const body: Record<string, string> = { email, password, platform: 'macOS' };
   if (referralCode) body.referralCode = referralCode;
   const response = await fetch(`${API_URL}/auth/register/standard`, {
     method: 'POST',
@@ -112,6 +124,7 @@ export async function registerAnonymous(): Promise<string> {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'include',
+    body: JSON.stringify({ platform: 'macOS' }),
   });
   const data = await handleResponse<{ accountNumber: string }>(response);
   return data.accountNumber;
@@ -237,6 +250,14 @@ export async function getAppConfig(): Promise<AppConfigResponse> {
     headers: { 'Content-Type': 'application/json' },
   });
   return handleResponse<AppConfigResponse>(response);
+}
+
+export async function getAnnouncements(): Promise<Announcement[]> {
+  const response = await fetch(`${API_URL}/app/announcements`, {
+    method: 'GET',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  return handleResponse<Announcement[]>(response);
 }
 
 export type { MeResponse, ApiError };

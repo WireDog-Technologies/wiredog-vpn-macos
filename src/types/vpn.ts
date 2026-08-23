@@ -49,6 +49,12 @@ export interface VPNSettings {
   splitTunneling: SplitTunnelingConfig;
   ipv6Enabled?: boolean;
   ipv6LeakProtection?: boolean;
+  // Guardian Mode — DNS-level ad/malware blocking, resolved server-side per connection
+  // (see resolveDnsAddresses in the backend's vpn.ts) based on these two flags sent with
+  // every /vpn/connect request. Matches iOS's independently-togglable Block Ads/Block
+  // Malware settings.
+  blockAdsEnabled?: boolean;
+  blockMalwareEnabled?: boolean;
 }
 
 export interface User {
@@ -81,6 +87,7 @@ export interface VPNStatusUpdate {
   killSwitchEnabled: boolean;
   advancedKillSwitchEnabled?: boolean;
   advancedKillSwitchActive?: boolean;
+  isReconnecting?: boolean;
 }
 
 export interface VPNStats {
@@ -94,6 +101,7 @@ declare global {
     electronAPI?: {
       vpn: {
         connect: (serverId: string, settings: VPNSettings) => Promise<VPNConnectionResult>;
+        cancelConnect: () => Promise<{ success: boolean }>;
         disconnect: (options?: { disableProtection?: boolean }) => Promise<{ success: boolean }>;
         getStatus: () => Promise<VPNStatusUpdate>;
         getStats: () => Promise<VPNStats | null>;

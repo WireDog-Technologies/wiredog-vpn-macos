@@ -19,12 +19,12 @@ import Logo from "../../assets/logos/wiredog-minimal-navy_1024x1024.png";
 import TextLogo from "../../assets/logos/wiredog_text_logo_1024.png";
 
 const RightSidebar: React.FC = () => {
-  const { connection, connect, disconnect, reconnect, settings, updateSettings, selectedServer, advancedKillSwitchActive, isSubscriptionActive } = useVPN();
+  const { connection, connect, disconnect, reconnect, settings, updateSettings, selectedServer, advancedKillSwitchActive, isSubscriptionActive, isSwitchingServer } = useVPN();
   const [showReconnectDialog, setShowReconnectDialog] = useState(false);
   const [reconnectMessage, setReconnectMessage] = useState('');
   const [showDisconnectDialog, setShowDisconnectDialog] = useState(false);
   const { getAppVersion } = useElectron();
-  const { data: geo } = useGeolocation(connection.status);
+  const { data: geo, isFetching: isGeoFetching } = useGeolocation(connection.status);
   const [appVersion, setAppVersion] = useState<string>('');
 
   useEffect(() => {
@@ -33,9 +33,22 @@ const RightSidebar: React.FC = () => {
   const { data: recommendedServers = [] } = useRecommendedServers();
   const defaultServer = recommendedServers[0];
 
-  const isConnected = connection.status === 'connected';
-  const isConnecting = connection.status === 'connecting';
+  const isConnected = connection.status === 'connected' && !isSwitchingServer;
+  // Includes isSwitchingServer so the brief disconnect->connect gap mid-switch (which
+  // connection.status genuinely passes through as 'disconnected') doesn't flicker the UI
+  // back to an idle/connectable state.
+  const isConnecting = connection.status === 'connecting' || isSwitchingServer;
   const isError = connection.status === 'error';
+  // Covers connecting, disconnecting, and reconnecting (macOS reports all three as
+  // 'connecting' — see VPNContext's status mapping) plus the brief window right after a
+  // transition where the geolocation query is still refetching. Mirrors iOS's
+  // isTransitioning, which shows "Loading..." instead of briefly displaying a stale or
+  // misleading location/IP left over from before the transition.
+  const isTransitioning = isConnecting || (!isConnected && !isError && isGeoFetching);
+  // "On" only when both filters are enabled — matches the quick-toggle's all-or-nothing
+  // click behavior. An individually-mixed state (e.g. ads on, malware off) still reads as
+  // "off" here; use Settings > Guardian Mode for that combination.
+  const guardianModeOn = (settings.blockAdsEnabled ?? true) && (settings.blockMalwareEnabled ?? true);
 
   const [sessionDuration, setSessionDuration] = useState('00:00:00');
 
@@ -114,7 +127,7 @@ const RightSidebar: React.FC = () => {
               "text-sm font-iosevka font-semibold whitespace-nowrap",
               isError ? "text-red-500" : isConnected ? "text-connection-active" : "text-accent"
             )}>
-              {isError ? `${connection.server?.city || '—'}, ${connection.server?.stateCode || '—'}` : isConnected ? `${connection.server?.city}, ${connection.server?.stateCode}` : (geo?.city ? `${geo.city}, ${geo.region}` : 'Redacted')}
+              {isTransitioning ? 'Loading...' : isError ? `${connection.server?.city || '—'}, ${connection.server?.stateCode || '—'}` : isConnected ? `${connection.server?.city}, ${connection.server?.stateCode}` : (geo?.city ? `${geo.city}, ${geo.region}` : 'Redacted')}
             </p>
           </div>
 
@@ -125,7 +138,7 @@ const RightSidebar: React.FC = () => {
               "text-sm font-iosevka font-semibold",
               isError ? "text-red-500" : isConnected ? "text-connection-active" : "text-accent"
             )}>
-              {isError ? '—' : isConnected ? (connection.ipAddress || 'Redacted') : (geo?.ip || 'Redacted')}
+              {isTransitioning ? 'Loading...' : isError ? '—' : isConnected ? (connection.ipAddress || 'Redacted') : (geo?.ip || 'Redacted')}
             </p>
           </div>
         </div>
@@ -318,21 +331,39 @@ const RightSidebar: React.FC = () => {
             </Tooltip>
           </TooltipProvider>
 
-          {/* Guardian Mode */}
+          {/* Guardian Mode — quick toggle for both DNS filters together; see
+              /settings/guardian-mode for independent Block Ads / Block Malware control. */}
           <TooltipProvider>
             <Tooltip>
               <TooltipTrigger asChild>
                 <button
-                  disabled
-                  className="relative flex items-center justify-center gap-2 w-full py-3 rounded-lg border transition-all duration-200 opacity-50 cursor-not-allowed bg-muted/30 border-border text-muted-foreground"
+                  onClick={() => {
+                    const newValue = !(guardianModeOn);
+                    updateSettings({ blockAdsEnabled: newValue, blockMalwareEnabled: newValue });
+                    if (isConnected) {
+                      setReconnectMessage(
+                        newValue
+                          ? 'Guardian Mode has been enabled. Reconnect now to apply it immediately, or it will apply on your next connection.'
+                          : 'Guardian Mode has been disabled. Reconnect now to apply it immediately, or it will apply on your next connection.'
+                      );
+                      setShowReconnectDialog(true);
+                    }
+                  }}
+                  disabled={isConnecting}
+                  className={cn(
+                    "flex items-center justify-center gap-2 w-full py-3 rounded-lg border transition-all duration-200",
+                    isConnecting && "opacity-50 cursor-not-allowed",
+                    guardianModeOn
+                      ? "bg-connection-active/20 border-connection-active text-connection-active"
+                      : "bg-muted/30 border-border text-muted-foreground hover:bg-muted/50"
+                  )}
                 >
                   <ShieldCheck className="w-7 h-7" />
                   <span className="text-xs font-medium">Guardian Mode</span>
-                  <span className="absolute top-1 right-1.5 text-[9px] font-bold text-muted-foreground/60 tracking-wider">SOON</span>
                 </button>
               </TooltipTrigger>
               <TooltipContent>
-                <p>Coming soon</p>
+                <p>Block ads and malware at the DNS level — tap to toggle both, or open Settings for individual control</p>
               </TooltipContent>
             </Tooltip>
           </TooltipProvider>

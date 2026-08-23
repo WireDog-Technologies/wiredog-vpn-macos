@@ -1,5 +1,5 @@
 // ================================
-// Load environment variables FIRST (dev only)
+// Load environment variables FIRST
 // ================================
 const path = require('path');
 const fs = require('fs');
@@ -7,12 +7,39 @@ const dotenv = require('dotenv');
 const { app } = require('electron');
 const log = require('electron-log');
 
-// Load .env only in development — production config is baked in at build time via Vite
+// Load environment config (API/frontend URLs — see .env.development / .env.production).
+// Mirrors iOS's Config-Debug.xcconfig / Config-Release.xcconfig split: unpackaged runs
+// (`npm run dev`, the macOS equivalent of Xcode's Run button) always default to
+// .env.development (integration), and a packaged build loads whichever file
+// scripts/build-production.sh baked into electron/.env at build time (.env.development
+// for `--integration`, .env.production otherwise). Vite handles the equivalent split for
+// the renderer bundle automatically via its own build-mode env file convention — this
+// block is only for the Electron main process, which Vite never touches.
+// electron/**/* is packed INTO app.asar by electron-builder.json's "files" list, not
+// extracted as a loose resource — so a packaged build's baked file lives at
+// Contents/Resources/app.asar/electron/.env, not Contents/Resources/electron/.env.
+// main.js itself runs from inside that same asar, so __dirname already resolves there
+// correctly in both dev and packaged builds (Electron's patched fs reads through asar
+// transparently) — using process.resourcesPath here was the bug.
+const envPath = app.isPackaged
+  ? path.join(__dirname, '.env')
+  : path.join(__dirname, '../.env.development');
+if (fs.existsSync(envPath)) {
+  dotenv.config({ path: envPath });
+  log.info('Loaded environment config from', envPath);
+} else if (app.isPackaged) {
+  log.warn('No baked environment config found at', envPath, '— falling back to hardcoded production defaults');
+} else {
+  log.warn('No .env.development found at', envPath, '— falling back to hardcoded production defaults');
+}
+
+// Local developer override (gitignored, never shipped) — see .env.local.example.
+// Not consulted in packaged builds; dev-only escape hatch (e.g. pointing at a local backend).
 if (!app.isPackaged) {
-  const devEnvPath = path.join(__dirname, '../.env');
-  if (fs.existsSync(devEnvPath)) {
-    dotenv.config({ path: devEnvPath });
-    log.info('Loaded .env from', devEnvPath);
+  const localEnvPath = path.join(__dirname, '../.env.local');
+  if (fs.existsSync(localEnvPath)) {
+    dotenv.config({ path: localEnvPath, override: true });
+    log.info('Loaded local overrides from', localEnvPath);
   }
 }
 
@@ -134,6 +161,12 @@ function createMainWindow() {
 
   mainWindow.on('closed', () => {
     mainWindow = null;
+  });
+
+  // Closest macOS analogue to iOS's willEnterForeground — retries any /vpn/disconnect
+  // calls still owed from a previous launch/session (see VPNService.retryPendingDisconnects).
+  mainWindow.on('focus', () => {
+    vpnService.handleAppForeground();
   });
 
   // Prevent new window creation
@@ -621,6 +654,11 @@ function setupIpcHandlers() {
     }
   });
 
+  ipcMain.handle('vpn:cancel-connect', () => {
+    vpnService.cancelConnect();
+    return { success: true };
+  });
+
   ipcMain.handle('vpn:disconnect', async (_, options = {}) => {
     const disableProtection = options?.disableProtection !== false;
     log.info(`VPN disconnect request (disableProtection=${disableProtection})`);
@@ -979,6 +1017,8 @@ async function initializeSettingsStore() {
           apps: [],
           ips: []
         },
+        blockAdsEnabled: true,
+        blockMalwareEnabled: true,
         lastServerId: null,
         authToken: null
       }
@@ -987,6 +1027,11 @@ async function initializeSettingsStore() {
     // (required for cold-start auto-reconnect when persistent_block is active)
     try { vpnService.setConfigStore(settingsStore); } catch (err) {
       log.warn('VPN: setConfigStore failed:', err.message);
+    }
+    // Lets VPNService fetch a fresh token itself for auto-reconnect and pending-disconnect
+    // retries, which originate internally rather than from an IPC call carrying a token.
+    try { vpnService.setAuthTokenProvider(() => decryptSecret(settingsStore.get('authToken'))); } catch (err) {
+      log.warn('VPN: setAuthTokenProvider failed:', err.message);
     }
     log.info('Settings store initialized');
   } catch (error) {

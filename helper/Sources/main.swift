@@ -15,7 +15,7 @@ import Foundation
 let logger = HelperLogger.shared
 
 logger.info("WireDog VPN Helper Daemon starting...")
-logger.info("Version: 1.0.0")
+logger.info("Version: \(HelperVersion.current)")
 logger.info("PID: \(ProcessInfo.processInfo.processIdentifier)")
 
 // Initialize components

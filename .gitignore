@@ -4,6 +4,9 @@ CLAUDE.md
 todo.md
 tasks/
 docs/
+VM_TESTING_README.md
+VPN_CONNECTION_DEBUG.md
+VPN_FIX_SUMMARY.md
 
 # Build-generated secrets
 .env.build
@@ -24,6 +27,8 @@ native/prebuilds/
 
 # Swift
 .build/
+# Regenerated from package.json by scripts/build-helper.sh — see that file's comment
+helper/Sources/GeneratedVersion.swift
 *.xcodeproj/xcuserdata/
 *.xcworkspace/xcuserdata/
 xcuserdata/

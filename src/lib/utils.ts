@@ -10,6 +10,7 @@ import ilFlag from "@/assets/flags/Flag_of_Illinois.svg";
 import maFlag from "@/assets/flags/Flag_of_Massachusetts.svg";
 import miFlag from "@/assets/flags/Flag_of_Michigan.svg";
 import mnFlag from "@/assets/flags/Flag_of_Minnesota.svg";
+import njFlag from "@/assets/flags/Flag_of_New_Jersey.svg";
 import nvFlag from "@/assets/flags/Flag_of_Nevada.svg";
 import nyFlag from "@/assets/flags/Flag_of_New_York.svg";
 import ncFlag from "@/assets/flags/Flag_of_North_Carolina.svg";
@@ -45,6 +46,7 @@ export function getUSStateFlag(stateCode: string): string {
     CO: coFlag,
     AZ: azFlag,
     NV: nvFlag,
+    NJ: njFlag,
     MA: maFlag,
     PA: paFlag,
     OH: ohFlag,
