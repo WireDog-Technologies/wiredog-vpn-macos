@@ -1449,6 +1449,9 @@ class VPNService {
       // retry may have claimed (so the counter stays net-zero) and tells the screen at once. Waiting
       // for an in-flight attempt to fail on its own took 10 to 15 s, or never happened between attempts.
       this.disconnect().catch(err => log.warn('VPN: cancelConnect disconnect failed:', err.message));
+    } else {
+      // Nothing to cancel: the screen is showing a stale 'connecting'. Send the real status so it corrects itself.
+      this.notifyStatusChange();
     }
   }
 
@@ -2112,6 +2115,10 @@ class VPNService {
         this._lastTargetServerId = targetServerId;
         await this.connect(targetServerId, this.settings, token, gatewayId);
         // Success: _connect() already reset isReconnecting/reconnectAttempts/connectedSince.
+        // Tell the screen. The tunnel's own 'connected' push arrives while isReconnecting is still true
+        // (the status then reads 'connecting'), and connect() sends nothing at the end, so without this
+        // the screen stays on "connecting" although the tunnel is up.
+        this.notifyStatusChange();
       } catch (err) {
         log.warn(`VPN: Reconnect attempt ${this.reconnectAttempts} failed: ${err.message}`);
         this._lastAttemptServerSide = !!(err && err.serverSide);
