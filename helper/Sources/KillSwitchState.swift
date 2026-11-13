@@ -40,6 +40,34 @@ class KillSwitchStateMachine {
         logger.info("Advanced kill switch disabled, pf rules flushed")
     }
 
+    /// Rescue Relay addresses the block must keep reachable (TCP 443 only). Sanitized by PfManager
+    /// (public IPv4, at most four). Saved with the state so a block restored at boot has them, and
+    /// applied at once to a block that is already up so a refreshed list does not wait for the next one.
+    var relayCount: Int { pfManager.relayIps.count }
+
+    /// [TEMP] pf status for the app log.
+    func pfDiagnostics() -> [String: Any] { pfManager.diagnostics() }
+
+    func setApiRelays(_ ips: [String]) throws {
+        let before = pfManager.relayIps
+        pfManager.setRelayIps(ips)
+        guard pfManager.relayIps != before else { return }
+        logger.info("Relay addresses set: \(pfManager.relayIps.count)")
+        saveState()
+        switch state {
+        case .bootstrap:
+            if let ip = lastServerIp { try pfManager.applyBootstrapRules(serverIp: ip, serverPort: lastServerPort) }
+        case .connected:
+            if let ip = lastServerIp, let iface = lastTunnelInterface {
+                try pfManager.applyConnectedRules(serverIp: ip, serverPort: lastServerPort, tunnelInterface: iface)
+            }
+        case .persistentBlock:
+            try pfManager.applyPersistentBlockRules(serverIp: lastServerIp)
+        case .disabled:
+            break
+        }
+    }
+
     func transitionToBootstrap(serverIp: String, serverPort: UInt16) throws {
         lastServerIp = serverIp
         lastServerPort = serverPort
@@ -97,6 +125,9 @@ class KillSwitchStateMachine {
             return
         }
 
+        // Before the block is rebuilt: the relay must be in it from the first rule.
+        pfManager.setRelayIps(saved.apiRelayIps ?? [])
+
         guard saved.advancedEnabled else { return }
 
         advancedEnabled = true
@@ -117,7 +148,8 @@ class KillSwitchStateMachine {
             state: state,
             advancedEnabled: advancedEnabled,
             lastServerIp: lastServerIp,
-            lastServerPort: lastServerPort
+            lastServerPort: lastServerPort,
+            apiRelayIps: pfManager.relayIps
         )
         if let data = try? JSONEncoder().encode(saved) {
             try? data.write(to: URL(fileURLWithPath: stateFilePath))
@@ -131,4 +163,6 @@ private struct SavedState: Codable {
     let advancedEnabled: Bool
     let lastServerIp: String?
     let lastServerPort: UInt16?
+    // Optional so a state file written by an older helper still decodes.
+    let apiRelayIps: [String]?
 }

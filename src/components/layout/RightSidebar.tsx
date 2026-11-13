@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Loader2, Shield, ShieldOff, Power, Split, ShieldCheck, Lock } from 'lucide-react';
+import { Loader2, Shield, ShieldOff, Power, Split, ShieldCheck, Lock, X } from 'lucide-react';
 import { SiWireguard, SiOpenvpn } from 'react-icons/si';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import {
@@ -15,11 +15,15 @@ import { useRecommendedServers } from '@/hooks/useServers';
 import { cn } from '@/lib/utils';
 import ReconnectDialog from '@/components/ReconnectDialog';
 import DisconnectDialog from '@/components/DisconnectDialog';
+import { openPricingPage } from "@/lib/api";
+import { shouldOfferSubscription } from "@/lib/account";
 import Logo from "../../assets/logos/wiredog-minimal-navy_1024x1024.png";
 import TextLogo from "../../assets/logos/wiredog_text_logo_1024.png";
 
 const RightSidebar: React.FC = () => {
-  const { connection, connect, disconnect, reconnect, settings, updateSettings, selectedServer, advancedKillSwitchActive, isSubscriptionActive, isSwitchingServer } = useVPN();
+  const { user, connection, connect, cancelConnect, disconnect, reconnect, settings, updateSettings, selectedServer, advancedKillSwitchActive, isSubscriptionActive, isSwitchingServer } = useVPN();
+  // Personal accounts without a plan are sent to the website to pick one; organization accounts are not.
+  const offerSubscription = shouldOfferSubscription(user, isSubscriptionActive);
   const [showReconnectDialog, setShowReconnectDialog] = useState(false);
   const [reconnectMessage, setReconnectMessage] = useState('');
   const [showDisconnectDialog, setShowDisconnectDialog] = useState(false);
@@ -77,10 +81,19 @@ const RightSidebar: React.FC = () => {
   }, [isConnected, connection.sessionStart]);
 
   const handleConnect = async () => {
-    if (isConnecting) return;
+    // No active plan: there is nothing to connect with, so send them to pick one (signed in).
+    if (!isConnected && !isConnecting && !isError && offerSubscription) {
+      await openPricingPage();
+      return;
+    }
+    if (isConnecting) {
+      await cancelConnect();
+      return;
+    }
     if (isError) {
-      // Connection lost — disconnect to clean up, then user can reconnect
-      await disconnect();
+      // Connection lost — disconnect to clean up, then user can reconnect. With Always-on the block
+      // stays; only turning Always-on off (link below the status) restores the internet.
+      await disconnect({ disableProtection: !settings.permanentKillSwitch });
       return;
     }
     if (isConnected) {
@@ -127,7 +140,7 @@ const RightSidebar: React.FC = () => {
               "text-sm font-iosevka font-semibold whitespace-nowrap",
               isError ? "text-red-500" : isConnected ? "text-connection-active" : "text-accent"
             )}>
-              {isTransitioning ? 'Loading...' : isError ? `${connection.server?.city || '—'}, ${connection.server?.stateCode || '—'}` : isConnected ? `${connection.server?.city}, ${connection.server?.stateCode}` : (geo?.city ? `${geo.city}, ${geo.region}` : 'Redacted')}
+              {isTransitioning ? 'Loading...' : isError ? `${connection.server?.city || '—'}, ${connection.server?.stateCode || '—'}` : isConnected ? (connection.server?.gatewayName ?? `${connection.server?.city}, ${connection.server?.stateCode}`) : (geo?.city ? `${geo.city}, ${geo.region}` : 'Redacted')}
             </p>
           </div>
 
@@ -138,7 +151,7 @@ const RightSidebar: React.FC = () => {
               "text-sm font-iosevka font-semibold",
               isError ? "text-red-500" : isConnected ? "text-connection-active" : "text-accent"
             )}>
-              {isTransitioning ? 'Loading...' : isError ? '—' : isConnected ? (connection.ipAddress || 'Redacted') : (geo?.ip || 'Redacted')}
+              {isTransitioning ? 'Loading...' : isError ? '—' : isConnected ? (connection.ipAddress || 'Unknown') : (geo?.ip || 'Redacted')}
             </p>
           </div>
         </div>
@@ -147,15 +160,16 @@ const RightSidebar: React.FC = () => {
         <div className="flex justify-center mb-4">
           <button
             onClick={handleConnect}
-            disabled={isConnecting || (!isConnected && !isSubscriptionActive)}
+            disabled={!isConnecting && !isConnected && !isSubscriptionActive && !offerSubscription}
+            title={isConnecting ? 'Cancel connecting' : !isConnected && !isError && offerSubscription ? 'Choose a plan' : undefined}
             className={cn(
-              "relative w-28 h-28 rounded-full flex items-center justify-center transition-all duration-300",
+              "relative w-28 h-28 rounded-full flex items-center justify-center transition-all duration-300 group",
               "border-4",
               isConnected && "border-connection-active bg-connection-active/10 glow-effect-green",
-              isConnecting && "border-connection-connecting bg-connection-connecting/10 glow-effect-gold",
+              isConnecting && "border-connection-connecting bg-connection-connecting/10 glow-effect-gold cursor-pointer",
               isError && "border-red-500 bg-red-500/10",
-              !isConnected && !isConnecting && !isError && isSubscriptionActive && "border-accent bg-accent/10 hover:bg-accent/20",
-              !isConnected && !isConnecting && !isError && !isSubscriptionActive && "border-border bg-muted/20 cursor-not-allowed"
+              !isConnected && !isConnecting && !isError && (isSubscriptionActive || offerSubscription) && "border-accent bg-accent/10 hover:bg-accent/20",
+              !isConnected && !isConnecting && !isError && !isSubscriptionActive && !offerSubscription && "border-border bg-muted/20 cursor-not-allowed"
             )}
           >
             <div className={cn(
@@ -166,7 +180,10 @@ const RightSidebar: React.FC = () => {
               !isConnected && !isConnecting && !isError && "bg-accent hover:bg-accent/90"
             )}>
               {isConnecting ? (
-                <Loader2 className="w-8 h-8 text-background animate-spin" />
+                <>
+                  <Loader2 className="w-8 h-8 text-background animate-spin group-hover:hidden" />
+                  <X className="w-8 h-8 text-background hidden group-hover:block" />
+                </>
               ) : isConnected ? (
                 <Shield className="w-8 h-8 text-background" />
               ) : isError ? (
@@ -190,6 +207,39 @@ const RightSidebar: React.FC = () => {
         )}>
           {isError ? "CONNECTION LOST" : isConnected ? "PROTECTED" : isConnecting ? "CONNECTING..." : advancedKillSwitchActive ? "PROTECTED (NO VPN)" : !isSubscriptionActive ? <>NO ACTIVE<br />SUBSCRIPTION</> : "UNPROTECTED"}
         </p>
+
+        {/* Why the internet is blocked, and the way out. Shown only while a kill switch is holding the block. */}
+        {isError && settings.killSwitch && !settings.permanentKillSwitch && (
+          <p className="text-center text-xs text-muted-foreground mb-2">
+            Can't reconnect. Your internet is paused to protect you. Click the button to disconnect and restore it.
+          </p>
+        )}
+        {isError && settings.permanentKillSwitch && (
+          <div className="text-center mb-2">
+            <p className="text-xs text-muted-foreground">
+              Can't reconnect. Always-on is keeping your internet blocked to protect you.
+            </p>
+            <button
+              onClick={() => updateSettings({ permanentKillSwitch: false })}
+              className="text-xs text-accent underline mt-1"
+            >
+              Turn off Always-on and restore internet
+            </button>
+          </div>
+        )}
+        {!isConnected && !isConnecting && !isError && settings.permanentKillSwitch && advancedKillSwitchActive && (
+          <div className="text-center mb-2">
+            <p className="text-xs text-muted-foreground">
+              Always-on is blocking your internet until you connect.
+            </p>
+            <button
+              onClick={() => updateSettings({ permanentKillSwitch: false })}
+              className="text-xs text-accent underline mt-1"
+            >
+              Turn off Always-on and restore internet
+            </button>
+          </div>
+        )}
 
         {/* Divider 2 */}
         <div className="h-px mb-4" />

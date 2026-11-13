@@ -1,4 +1,5 @@
 import NetworkExtension
+import Network
 import WireGuardKit
 import os.log
 import Foundation
@@ -58,6 +59,109 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             self?.diagLog("[WG] \(message)")
         }
     }()
+
+    // MARK: - Tunnel health (served on loopback)
+    //
+    // The app cannot ask the extension for its state (sendProviderMessage is unreliable from the Electron
+    // process; stats are read from the utun counters instead), and the counters say nothing about whether
+    // the server ever answered. This extension is sandboxed and runs as root, so it cannot write a file the
+    // user's app can read (its /tmp and App Group container are not visible to the user session). It does
+    // have the network-server entitlement, so while the tunnel is up it serves a small JSON snapshot on
+    // 127.0.0.1 only, and the app reads it:
+    //   { "updatedAt": <epoch s>, "lastHandshake": <epoch s, 0 = never>, "rxBytes": n, "txBytes": n }
+    // The data is not secret (timestamps and byte counters). The app treats an unreachable or stale
+    // snapshot as "unknown", never as a failure, so this can only cost it the check, not break connecting.
+
+    static let healthPort: UInt16 = 51873
+    private let healthQueue = DispatchQueue(label: "com.wiredog.vpn.macos.tunnel.health")
+    private var healthTimer: DispatchSourceTimer?
+    private var healthListener: NWListener?
+    private var healthBody = Data("{}".utf8)
+    private var healthWrittenOnce = false
+
+    private func startHealthServer() {
+        stopHealthServer()
+        guard let port = NWEndpoint.Port(rawValue: PacketTunnelProvider.healthPort) else { return }
+        let params = NWParameters.tcp
+        params.allowLocalEndpointReuse = true
+        // Loopback only: 127.0.0.1, never a routable address.
+        params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: port)
+        guard let listener = try? NWListener(using: params) else {
+            diagLog("[Health] could not create the loopback listener on \(PacketTunnelProvider.healthPort)")
+            return
+        }
+        listener.newConnectionHandler = { [weak self] connection in
+            guard let self = self else { connection.cancel(); return }
+            connection.start(queue: self.healthQueue)
+            // Read the request first: closing with it unread can reset the connection before the client reads.
+            connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] _, _, _, _ in
+                guard let self = self else { connection.cancel(); return }
+                let head = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nContent-Length: \(self.healthBody.count)\r\nConnection: close\r\n\r\n"
+                var response = Data(head.utf8)
+                response.append(self.healthBody)
+                connection.send(content: response, completion: .contentProcessed { _ in connection.cancel() })
+            }
+        }
+        listener.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready: self?.diagLog("[Health] serving the tunnel snapshot on 127.0.0.1:\(PacketTunnelProvider.healthPort)")
+            case .failed(let error): self?.diagLog("[Health] listener failed: \(error)")
+            default: break
+            }
+        }
+        listener.start(queue: healthQueue)
+        healthListener = listener
+
+        let timer = DispatchSource.makeTimerSource(queue: healthQueue)
+        timer.schedule(deadline: .now() + 1, repeating: 3)
+        timer.setEventHandler { [weak self] in self?.refreshHealthSnapshot() }
+        timer.resume()
+        healthTimer = timer
+    }
+
+    private func stopHealthServer() {
+        healthTimer?.cancel()
+        healthTimer = nil
+        healthListener?.cancel()
+        healthListener = nil
+        healthBody = Data("{}".utf8)
+        healthWrittenOnce = false
+    }
+
+    private func refreshHealthSnapshot() {
+        wireGuardAdapter.getRuntimeConfiguration { [weak self] runtimeConfig in
+            guard let self = self, let configString = runtimeConfig else { return }
+            var lastSec: Int64 = 0
+            var rx: UInt64 = 0
+            var tx: UInt64 = 0
+            for line in configString.split(separator: "\n") {
+                let parts = line.split(separator: "=", maxSplits: 1)
+                guard parts.count == 2 else { continue }
+                let key = parts[0].trimmingCharacters(in: .whitespaces)
+                let value = parts[1].trimmingCharacters(in: .whitespaces)
+                switch key {
+                case "last_handshake_time_sec": lastSec = max(lastSec, Int64(value) ?? 0)
+                case "rx_bytes": rx += UInt64(value) ?? 0
+                case "tx_bytes": tx += UInt64(value) ?? 0
+                default: break
+                }
+            }
+            let snapshot: [String: Any] = [
+                "updatedAt": Int64(Date().timeIntervalSince1970),
+                "lastHandshake": lastSec,
+                "rxBytes": rx,
+                "txBytes": tx,
+            ]
+            guard let data = try? JSONSerialization.data(withJSONObject: snapshot) else { return }
+            self.healthQueue.async {
+                self.healthBody = data
+                if !self.healthWrittenOnce {
+                    self.healthWrittenOnce = true
+                    self.diagLog("[Health] first snapshot ready, lastHandshake=\(lastSec)")
+                }
+            }
+        }
+    }
 
     // MARK: - Tunnel Lifecycle
 
@@ -203,6 +307,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             sharedDefaults?.set(String(data: configData, encoding: .utf8), forKey: "tunnelConfig")
 
             self.diagLog("Tunnel started successfully")
+            self.startHealthServer()
             completionHandler(nil)
         }
     }
@@ -232,6 +337,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         completionHandler: @escaping () -> Void
     ) {
         diagLog("Stopping tunnel (reason: \(reason.rawValue))")
+        stopHealthServer()
 
         wireGuardAdapter.stop { [weak self] error in
             if let error = error {

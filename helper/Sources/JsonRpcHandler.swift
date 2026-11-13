@@ -89,7 +89,19 @@ class JsonRpcHandler {
                     reply(errorResponse(id: id, code: -1, message: "Unknown state: \(state)"))
                     return
                 }
-                reply(successResponse(id: id, result: ["success": true]))
+                reply(successResponse(id: id, result: ["success": true, "pf": killSwitchState.pfDiagnostics()]))
+            } catch {
+                reply(errorResponse(id: id, code: -1, message: error.localizedDescription))
+            }
+
+        case "getPfDiag":
+            reply(successResponse(id: id, result: ["pf": killSwitchState.pfDiagnostics(), "state": killSwitchState.state.rawValue]))
+
+        case "setApiRelays":
+            let ips = params?["ips"] as? [String] ?? []
+            do {
+                try killSwitchState.setApiRelays(ips)
+                reply(successResponse(id: id, result: ["success": true, "applied": killSwitchState.relayCount]))
             } catch {
                 reply(errorResponse(id: id, code: -1, message: error.localizedDescription))
             }
