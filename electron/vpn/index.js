@@ -123,6 +123,11 @@ class VPNService {
     // crash-recovery retry and a foreground retry landing close together).
     this.sessionsPendingCleanup = new Set();
     this.hasHandledFirstFocusEvent = false;
+    // Single-flight guard for connect(): the promise of the attempt currently running (and the
+    // server it is for). connect() does several awaits before it claims a session, so without
+    // this two triggers can both call /vpn/connect and orphan the first one's counter increment.
+    this._connectPromise = null;
+    this._connectingServerId = null;
 
     log.info('VPN Service initialized (macOS)');
     log.info('API Base URL:', this.apiBaseUrl);
@@ -194,6 +199,27 @@ class VPNService {
     this.configStore.set('pendingDisconnectIds', Array.from(ids));
   }
 
+  /** First 8 characters of a session id: enough to correlate log lines without writing the full token. */
+  _short(sessionId) {
+    return sessionId ? String(sessionId).slice(0, 8) : 'none';
+  }
+
+  // --- Released-session ledger ---
+  // The backend's /disconnect is NOT idempotent, so a session that was already released must
+  // never be released again (several paths can reach the same session: a drop, a supersede, a
+  // crash-recovery pass). Confirmed releases are remembered here, capped, across restarts.
+  _wasRecentlyReleased(sessionId) {
+    if (!this.configStore) return false;
+    return (this.configStore.get('releasedSessionIds', []) || []).includes(sessionId);
+  }
+
+  _markReleased(sessionId) {
+    if (!this.configStore) return;
+    const ids = (this.configStore.get('releasedSessionIds', []) || []).filter(id => id !== sessionId);
+    ids.push(sessionId);
+    this.configStore.set('releasedSessionIds', ids.slice(-50));
+  }
+
   /**
    * Best-effort notification to the backend that a session is no longer valid, so its
    * device-count slot is released. This is the single choke point every code path that could
@@ -204,13 +230,27 @@ class VPNService {
    * silently, but the record survives so retryPendingDisconnects() can retry it later instead of
    * leaking the counter forever. The backend's /disconnect is NOT idempotent (unconditionally
    * decrements on every valid call), so sessionsPendingCleanup guards against firing two
-   * concurrent calls for the same session.
+   * concurrent calls for the same session, and the released-session ledger guards against
+   * releasing one that was already confirmed.
    */
   cleanupOrphanedSession(sessionId, reason) {
-    if (this.sessionsPendingCleanup.has(sessionId)) return;
+    if (!sessionId) {
+      log.warn(`CONN_COUNTER: release requested with no session id (${reason}) — nothing to send`);
+      return;
+    }
+    if (this.sessionsPendingCleanup.has(sessionId)) {
+      log.info(`CONN_COUNTER: /disconnect for ${this._short(sessionId)} already in flight, skipping duplicate (${reason})`);
+      return;
+    }
+    if (this._wasRecentlyReleased(sessionId)) {
+      log.warn(`CONN_COUNTER: session ${this._short(sessionId)} was already released, skipping duplicate /disconnect (${reason})`);
+      this._removePendingDisconnect(sessionId);
+      return;
+    }
     this.sessionsPendingCleanup.add(sessionId);
 
     log.info(`VPN: cleaning up orphaned session (${reason})`);
+    log.info(`CONN_COUNTER: -1 queued /disconnect for session ${this._short(sessionId)} (${reason})`);
     this._addPendingDisconnect(sessionId);
 
     setTimeout(async () => {
@@ -225,16 +265,62 @@ class VPNService {
           body: JSON.stringify({ sessionId }),
         });
         if (response.ok) {
+          this._markReleased(sessionId);
           this._removePendingDisconnect(sessionId);
+          log.info(`CONN_COUNTER: -1 /disconnect confirmed for session ${this._short(sessionId)} (${reason})`);
+          this._logConnectionCounter('after disconnect');
+        } else {
+          // Non-ok: left in the pending list, retried via retryPendingDisconnects() later.
+          log.error(`CONN_COUNTER: /disconnect FAILED for session ${this._short(sessionId)} (${reason}): HTTP ${response.status} — counter stays incremented until retried`);
         }
-        // Non-ok: left in the pending list, retried via retryPendingDisconnects() later.
       } catch (err) {
         log.warn('VPN: cleanupOrphanedSession disconnect failed (will retry):', err.message);
+        log.error(`CONN_COUNTER: /disconnect FAILED for session ${this._short(sessionId)} (${reason}): ${err.message} — counter stays incremented until retried`);
         // Left in the pending list — retried via retryPendingDisconnects() later.
       } finally {
         this.sessionsPendingCleanup.delete(sessionId);
       }
     }, this.disconnectNotifyDelayMs);
+  }
+
+  /**
+   * Asks the backend what its active_connection_counter currently says and logs it next to what
+   * this app believes it holds. A counter that rises with no matching local event shows up as a
+   * `localSession=none` with backend>0 mismatch (another device, or a leaked session). Purely
+   * diagnostic: never throws, never blocks the caller, skipped when there is no auth token.
+   * Mirrors iOS's logConnectionCounter.
+   */
+  async _logConnectionCounter(context) {
+    try {
+      const token = this._getAuthToken ? this._getAuthToken() : '';
+      if (!token) return;
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
+      let response;
+      try {
+        response = await fetch(`${this.apiBaseUrl}/vpn/status`, {
+          headers: { Authorization: `Bearer ${token}` },
+          credentials: 'include',
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeoutId);
+      }
+      if (!response.ok) {
+        log.warn(`CONN_COUNTER [${context}]: status check failed: HTTP ${response.status}`);
+        return;
+      }
+      const status = await response.json();
+      const pending = this._pendingDisconnectIds().map(id => this._short(id)).join(',');
+      log.info(
+        `CONN_COUNTER [${context}]: backend=${status.activeConnections}/${status.maxConnections} ` +
+        `localSession=${this._short(this.currentSession?.sessionId)} ` +
+        `configSession=${this._short(this.lastConnectionConfig?.sessionId)} ` +
+        `reconnecting=${this.isReconnecting} pendingDisconnects=[${pending}]`
+      );
+    } catch (err) {
+      log.warn(`CONN_COUNTER [${context}]: status check failed: ${err.message}`);
+    }
   }
 
   /**
@@ -255,6 +341,7 @@ class VPNService {
    * initialize() already performs, so it's skipped there in favor of that one.
    */
   handleAppForeground() {
+    this._logConnectionCounter('app foreground');
     if (this.hasHandledFirstFocusEvent) {
       this.retryPendingDisconnects();
     } else {
@@ -342,35 +429,8 @@ class VPNService {
           log.warn('VPN: getKillSwitchState failed:', err.message);
         }
 
-        // Crash recovery: if we have a persisted sessionId but the tunnel is not
-        // currently active, the previous app instance exited without cleanly calling
-        // /disconnect. Send a best-effort disconnect now so the backend counter
-        // decrements correctly. Keep the WireGuard config intact — the kill-switch
-        // reconnect path may still need it.
-        if (this.lastConnectionConfig?.sessionId) {
-          try {
-            const _crashAddon = this._getNativeAddon();
-            const tunnelStatusStr = _crashAddon ? _crashAddon.getStatus() : 'disconnected';
-
-            if (tunnelStatusStr === 'disconnected') {
-              log.info('VPN: Startup crash recovery — cleaning up stale session %s',
-                this.lastConnectionConfig.sessionId);
-
-              // Durable cleanup — if this fails (no connectivity yet at cold start), the
-              // sessionId survives in the pending-disconnect ledger and gets retried by
-              // retryPendingDisconnects() on a later launch/foreground instead of being
-              // forgotten outright.
-              this.cleanupOrphanedSession(this.lastConnectionConfig.sessionId, 'crash recovery — stale session');
-
-              // Clear the stale sessionId but preserve the WireGuard config
-              // so the kill-switch persistent-block reconnect path can still use it
-              this.lastConnectionConfig.sessionId = null;
-              this._persistLastConnectionConfig();
-            }
-          } catch (err) {
-            log.warn('VPN: Startup crash recovery check failed:', err.message);
-          }
-        }
+        // Crash recovery: release a session the previous app instance never released.
+        this._recoverStaleSession('helper connected');
       } catch (error) {
         log.warn('VPN: Helper daemon not available:', error.message);
         this.helperConnected = false;
@@ -384,6 +444,47 @@ class VPNService {
       }
     } else {
       log.info('VPN: Helper daemon not installed (VPN unavailable until installed)');
+    }
+
+    log.info(`CONN_COUNTER: startup — restored session=${this._short(this.currentSession?.sessionId)} configSession=${this._short(this.lastConnectionConfig?.sessionId)} pendingDisconnects=${this._pendingDisconnectIds().length}`);
+    // The auth token is stored a moment after launch, so give it time before asking the backend.
+    setTimeout(() => this._logConnectionCounter('app launch'), 3000);
+  }
+
+  /**
+   * Crash recovery: if we have a persisted sessionId but the tunnel is not currently active, the
+   * previous app instance exited without cleanly calling /disconnect. Send a best-effort
+   * disconnect now so the backend counter decrements correctly. Keeps the WireGuard config
+   * intact — the kill-switch reconnect path may still need it.
+   *
+   * Called from every startup path that ends with a usable tunnel manager, not only the one where
+   * the helper daemon was already running. When the daemon had to be reinstalled (it was missing
+   * on both relaunches in the customer log) this used to be skipped, and the old session was
+   * lost the moment the next connect() overwrote lastConnectionConfig.
+   */
+  _recoverStaleSession(source) {
+    const sessionId = this.lastConnectionConfig?.sessionId;
+    if (!sessionId) return;
+    try {
+      const addon = this._getNativeAddon();
+      const tunnelStatusStr = addon ? addon.getStatus() : 'disconnected';
+      if (tunnelStatusStr !== 'disconnected') {
+        log.info(`CONN_COUNTER: startup — session ${this._short(sessionId)} left in place, tunnel status is ${tunnelStatusStr} (${source})`);
+        return;
+      }
+      log.info('VPN: Startup crash recovery — cleaning up stale session %s (%s)', this._short(sessionId), source);
+
+      // Durable cleanup — if this fails (no connectivity yet at cold start), the sessionId
+      // survives in the pending-disconnect ledger and gets retried by retryPendingDisconnects()
+      // on a later launch/foreground instead of being forgotten outright.
+      this.cleanupOrphanedSession(sessionId, 'crash recovery — stale session');
+
+      // Clear the stale sessionId but preserve the WireGuard config so the kill-switch
+      // persistent-block reconnect path can still use it.
+      this.lastConnectionConfig.sessionId = null;
+      this._persistLastConnectionConfig();
+    } catch (err) {
+      log.warn('VPN: Startup crash recovery check failed:', err.message);
     }
   }
 
@@ -443,6 +544,9 @@ class VPNService {
             });
             // Activate the system extension now that the helper is confirmed running
             this._activateSysext();
+            // Crash recovery used to run only when the daemon was already up at launch. Give the
+            // tunnel manager a moment to load so the status check below is meaningful.
+            setTimeout(() => this._recoverStaleSession('helper reinstalled'), 3000);
             resolve(true);
           } catch (err) {
             if (attemptsLeft > 0) {
@@ -634,7 +738,40 @@ class VPNService {
    * Connect to a VPN server
    */
   async connect(serverId, settings, token = '') {
-    log.info(`VPN: Connect request to server ${serverId}`);
+    // An attempt that was just cancelled may still be unwinding; let it finish so a switch to a
+    // different server is not refused for a connect nobody wants any more.
+    if (this._connectPromise && this._connectAbortToken?.cancelled) {
+      try { await this._connectPromise; } catch { /* the cancelled attempt's own error */ }
+    }
+
+    // Single-flight. connect() awaits the helper, the extension and the backend before it claims
+    // a session, so two triggers (auto-connect, a retry timer, a click) can both get this far and
+    // each call /vpn/connect; the second session overwrites the first and its counter increment
+    // is orphaned. A duplicate for the same server joins the attempt already running.
+    if (this._connectPromise) {
+      if (this._connectingServerId === serverId) {
+        log.warn(`CONN_COUNTER: duplicate connect to ${serverId} joined the attempt already in flight`);
+        return this._connectPromise;
+      }
+      log.warn(`CONN_COUNTER: connect to ${serverId} rejected — a connect to ${this._connectingServerId} is already in flight`);
+      throw new Error('VPN is already connecting');
+    }
+
+    this._connectingServerId = serverId;
+    const attempt = this._connect(serverId, settings, token);
+    this._connectPromise = attempt;
+    try {
+      return await attempt;
+    } finally {
+      if (this._connectPromise === attempt) {
+        this._connectPromise = null;
+        this._connectingServerId = null;
+      }
+    }
+  }
+
+  async _connect(serverId, settings, token = '') {
+    log.info(`VPN: Connect request to server ${serverId} (heldSession=${this._short(this.currentSession?.sessionId)}, configSession=${this._short(this.lastConnectionConfig?.sessionId)}, reconnecting=${this.isReconnecting})`);
     this.settings = settings;
 
     // Cooperative cancellation token for this specific attempt — cancelConnect() flips
@@ -738,6 +875,12 @@ class VPNService {
         const responseData = await response.json();
         ({ config, sessionId, server } = responseData);
         this.currentServerId = serverId;
+        log.info(`CONN_COUNTER: +1 /connect granted session ${this._short(sessionId)} server=${serverId} reconnect=${this.isReconnecting}`);
+
+        // The new session is about to overwrite whatever this app still holds. Anything held that
+        // was never released (a stable drop, a session restored after an unclean quit that crash
+        // recovery missed) would otherwise keep its counter increment forever.
+        this._releaseSupersededSessions(sessionId);
 
         log.info('VPN: Received connection config');
         log.info('VPN: Server location:', server?.city ? `${server.city}, ${server.stateCode || ''}` : 'unknown');
@@ -887,6 +1030,7 @@ class VPNService {
       };
 
       log.info('VPN: Connected successfully');
+      this._logConnectionCounter('after connect');
       // Do NOT call notifyStatusChange() here — the NE tunnel is still starting at this
       // point and the helper would report 'disconnected' or 'connecting', causing the
       // frontend to flicker. The tunnelStatusChanged notification from the helper daemon
@@ -942,6 +1086,22 @@ class VPNService {
         }
       }
       throw error;
+    }
+  }
+
+  /**
+   * Releases any session this app still holds (in memory or in the persisted connection config)
+   * other than the one that was just claimed. Safe to call when nothing is held, and safe if a
+   * session was already released: cleanupOrphanedSession() refuses to release one twice.
+   */
+  _releaseSupersededSessions(newSessionId) {
+    const held = new Set(
+      [this.currentSession?.sessionId, this.lastConnectionConfig?.sessionId].filter(Boolean)
+    );
+    for (const priorSessionId of held) {
+      if (priorSessionId === newSessionId) continue;
+      log.warn(`CONN_COUNTER: new session ${this._short(newSessionId)} replaces unreleased ${this._short(priorSessionId)} — releasing the old one`);
+      this.cleanupOrphanedSession(priorSessionId, 'superseded by a new connect');
     }
   }
 
@@ -1025,6 +1185,10 @@ class VPNService {
       // fire-and-forget fetch, so a disconnect lost to a network blip doesn't leak the counter.
       if (this.currentSession) {
         this.cleanupOrphanedSession(this.currentSession.sessionId, 'user-initiated disconnect');
+      } else if (disableProtection && this.lastConnectionConfig?.sessionId) {
+        // Disconnected during the gap between a drop and the reconnect claiming a new session:
+        // the dropped session is still held in the cached config and nothing else will release it.
+        this.cleanupOrphanedSession(this.lastConnectionConfig.sessionId, 'user-initiated disconnect (held from a dropped connection)');
       }
 
       this.currentSession = null;
@@ -1364,16 +1528,25 @@ class VPNService {
       const wasStable = this.connectedSince != null &&
         (Date.now() - this.connectedSince) >= this.minimumStableConnectionDuration * 1000;
 
-      // Connection never proved itself stable — clean up its slot rather than letting the
-      // upcoming reconnect attempt leak another increment on top of this orphaned one.
-      // (A connection that *was* stable and then drops is not cleaned up here — the reconnect
-      // attempt below claims a brand-new session instead. This mirrors iOS exactly, including
-      // its own known gap: that old session's slot is only reclaimed via the backend's manual
-      // /vpn/reset-connections escape hatch, not automatically.)
-      if (!wasStable && staleSessionId) {
+      // Release the dropped session's slot before the reconnect claims a new one. This used to be
+      // done only for connections that dropped inside the stability window; a connection that was
+      // stable and then dropped was forgotten, so every such drop (the customer log shows one
+      // every day or two) left one slot taken on the backend for good, since the backend never
+      // lowers the counter on its own.
+      //
+      // The one case that keeps the session: Always-On (permanent kill switch) can reconnect from
+      // the cached config and reuse this same session, so releasing it here would remove the very
+      // peer the reconnect is about to use. There it stays in lastConnectionConfig and is released
+      // when a different session replaces it (_releaseSupersededSessions), when reconnecting gives
+      // up, or on disconnect.
+      const keepsSessionForReuse = !!this.settings?.permanentKillSwitch;
+      log.info(`CONN_COUNTER: unexpected drop, session=${this._short(staleSessionId)} stable=${wasStable} alwaysOn=${keepsSessionForReuse} — ${(!wasStable || !keepsSessionForReuse) ? 'releasing it' : 'holding it until the reconnect decides whether to reuse it'}`);
+      if (staleSessionId && (!wasStable || !keepsSessionForReuse)) {
         this.cleanupOrphanedSession(
           staleSessionId,
-          `dropped before ${this.minimumStableConnectionDuration}s stability threshold`
+          wasStable
+            ? 'unexpected drop after a stable connection'
+            : `dropped before ${this.minimumStableConnectionDuration}s stability threshold`
         );
       }
 
@@ -1429,8 +1602,11 @@ class VPNService {
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       this.isReconnecting = false;
       log.error(`VPN: Reconnection failed after ${this.maxReconnectAttempts} attempts`);
-      if (this.currentSession?.sessionId) {
-        this.cleanupOrphanedSession(this.currentSession.sessionId, 'reconnect attempts exhausted');
+      // currentSession was cleared when the tunnel dropped, so a session held for reuse lives in
+      // lastConnectionConfig; release whichever is still held.
+      const held = this.currentSession?.sessionId || this.lastConnectionConfig?.sessionId;
+      if (held) {
+        this.cleanupOrphanedSession(held, 'reconnect attempts exhausted');
       }
       this.currentServerId = null;
       this.notifyStatusChange();
