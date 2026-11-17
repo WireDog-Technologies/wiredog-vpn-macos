@@ -32,6 +32,8 @@ do {
 } catch {
     logger.error("Failed to restore kill switch state: \(error.localizedDescription)")
 }
+// Keep the block real for as long as the daemon runs (see startWatchdog).
+killSwitchState.startWatchdog()
 
 // Start Unix domain socket server
 let isDev = ProcessInfo.processInfo.environment["WIREDOG_DEV"] != nil
@@ -78,8 +80,12 @@ class HelperLogger {
     private let fileHandle: FileHandle?
 
     private init() {
-        // Create log file if it doesn't exist
-        FileManager.default.createFile(atPath: logPath, contents: nil)
+        // Keep the log across daemon restarts and reboots (createFile on an existing path emptied it, which
+        // erased the evidence of the failure that came before a restart). Start over only past 2 MB.
+        let size = (try? FileManager.default.attributesOfItem(atPath: logPath)[.size] as? Int) ?? nil
+        if !FileManager.default.fileExists(atPath: logPath) || (size ?? 0) > 2_000_000 {
+            FileManager.default.createFile(atPath: logPath, contents: nil)
+        }
         fileHandle = FileHandle(forWritingAtPath: logPath)
         fileHandle?.seekToEndOfFile()
     }

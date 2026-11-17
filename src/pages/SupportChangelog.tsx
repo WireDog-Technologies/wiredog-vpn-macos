@@ -8,13 +8,27 @@ import { useElectron } from '@/context/ElectronContext';
 const SupportChangelog: React.FC = () => {
   const navigate = useNavigate();
   const { getAppVersion } = useElectron();
-  const [appVersion, setAppVersion] = useState('1.1.0');
+  const [appVersion, setAppVersion] = useState('1.2.0');
 
   useEffect(() => {
     getAppVersion().then(setAppVersion).catch(() => {});
   }, [getAppVersion]);
 
   const changelog = [
+    {
+      version: '1.2.0',
+      date: 'November 2026',
+      changes: [
+        'WireDog Business support: SSO sign-in, two-factor authentication, and organization Dedicated IPs.',
+        'Forgot password: reset your password from the sign-in screen.',
+        'Manage Account now opens your account dashboard already signed in.',
+        'Your connection now recovers after your Mac sleeps or the lid is closed, without having to reconnect.',
+        'Fixed server latency appearing higher than it really is while connected.',
+        'Fixed connections that could use up an extra device slot, and reconnecting now waits between attempts.',
+        'Reworked Kill Switch and Always-On protection, with fixes for several edge cases where traffic could leak.',
+        'You can now sign in again and reconnect even while the kill switch is blocking your traffic.',
+      ],
+    },
     {
       version: '1.1.0',
       date: 'August 2026',

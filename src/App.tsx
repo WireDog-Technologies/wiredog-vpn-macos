@@ -9,8 +9,13 @@ import ExtensionApprovalDialog from "./components/ExtensionApprovalDialog";
 import ConnectionErrorToast from "./components/ConnectionErrorToast";
 import ErrorBoundary from "./components/ErrorBoundary";
 import LoadingScreen from "./components/LoadingScreen";
+import LegalGate from "./components/LegalGate";
 import AppLayout from "./components/layout/AppLayout";
 import Login from "./pages/Login";
+import ForgotPassword from "./pages/ForgotPassword";
+import ForcedPasswordChange from "./pages/ForcedPasswordChange";
+import TwoFactorSetupRequired from "./pages/TwoFactorSetupRequired";
+import { accountGate } from "./lib/account";
 import CreateAccount from "./pages/CreateAccount";
 import StandardAccount from "./pages/StandardAccount";
 import AnonymousAccount from "./pages/AnonymousAccount";
@@ -34,12 +39,18 @@ import NotFound from "./pages/NotFound";
 const queryClient = new QueryClient();
 
 const ProtectedRoute: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const { isAuthenticated } = useVPN();
-  
+  const { isAuthenticated, user } = useVPN();
+
   if (!isAuthenticated) {
     return <Navigate to="/" replace />;
   }
-  
+
+  // Business accounts can be gated before the app opens. Same order as the website's dashboard:
+  // replace the temporary password first, then the org-required 2FA setup.
+  const gate = accountGate(user);
+  if (gate === 'password-change') return <ForcedPasswordChange />;
+  if (gate === 'two-factor-setup') return <TwoFactorSetupRequired />;
+
   return <>{children}</>;
 };
 
@@ -50,6 +61,7 @@ const AppRoutes: React.FC = () => {
     <Routes>
       <Route path="/compact" element={<CompactWindow />} />
       <Route path="/" element={isAuthenticated ? <Navigate to="/dashboard" replace /> : <Login />} />
+      <Route path="/forgot-password" element={<ForgotPassword />} />
       <Route path="/create-account" element={<CreateAccount />} />
       <Route path="/create-account/standard" element={<StandardAccount />} />
       <Route path="/create-account/anonymous" element={<AnonymousAccount />} />
@@ -129,9 +141,11 @@ const AppContent = () => {
       <UpdateDialog />
       <ExtensionApprovalDialog />
       <ConnectionErrorToast />
-      <HashRouter>
-        <AppRoutes />
-      </HashRouter>
+      <LegalGate>
+        <HashRouter>
+          <AppRoutes />
+        </HashRouter>
+      </LegalGate>
     </>
   );
 };

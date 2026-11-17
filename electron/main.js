@@ -46,8 +46,10 @@ if (!app.isPackaged) {
 // ================================
 // Import Electron and other modules
 // ================================
-const { BrowserWindow, ipcMain, Menu, Tray, shell, dialog, nativeImage, safeStorage, Notification } = require('electron');
+const { BrowserWindow, ipcMain, Menu, Tray, shell, dialog, nativeImage, safeStorage, Notification, powerMonitor } = require('electron');
 const vpnService = require('./vpn');
+const apiRelay = require('./apiRelay');
+const sso = require('./sso');
 const { getInstalledApps, readPlist, extractAppIcon } = require('./utils/appDiscovery');
 
 // Configure logging
@@ -104,6 +106,69 @@ const connectSrc = isDev
 
 // Track whether app is quitting to distinguish from hide-to-menu-bar
 let isQuitting = false;
+
+// A crashed or killed window process must not take the VPN down with it. The main process still holds the
+// tunnel, the session and the kill switch; tearing those down here (as this used to) left the user on
+// their real IP behind a blank window, with the standard kill switch's block lifted. Reload the window
+// instead and let it pick the state up again. At most three reloads a minute, so a window that cannot
+// start does not loop; past that the window stays down and the protection stays exactly as it was.
+const rendererReloads = new Map();
+function recoverCrashedWindow(win, label, details) {
+  log.error(`${label}: renderer process gone:`, details);
+  if (isQuitting || !win || win.isDestroyed() || details?.reason === 'clean-exit') return;
+  const now = Date.now();
+  const recent = (rendererReloads.get(label) || []).filter((t) => now - t < 60000);
+  if (recent.length >= 3) {
+    rendererReloads.set(label, recent);
+    log.error(`${label}: the renderer went down ${recent.length} times in the last minute, not reloading it again. The VPN connection and its protection are left as they are.`);
+    return;
+  }
+  recent.push(now);
+  rendererReloads.set(label, recent);
+  log.warn(`${label}: reloading the window. The VPN connection and its protection are left untouched.`);
+  try {
+    win.webContents.reload();
+  } catch (error) {
+    log.error(`${label}: reload after the renderer crash failed:`, error);
+  }
+}
+
+// Enforce a single instance: two copies would each run a tunnel manager and fight over the helper.
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  app.quit();
+}
+
+// Register wiredog:// so the browser can hand the SSO callback (wiredog://sso?code=...) back to the
+// app. In a packaged build the bundle's URL scheme entry (see electron-builder.json) does the real
+// work; this covers unpackaged runs where possible.
+try {
+  if (process.defaultApp && process.argv.length >= 2) {
+    app.setAsDefaultProtocolClient(sso.CALLBACK_SCHEME, process.execPath, [path.resolve(process.argv[1])]);
+  } else {
+    app.setAsDefaultProtocolClient(sso.CALLBACK_SCHEME);
+  }
+} catch (error) {
+  log.warn('Could not register the wiredog:// protocol handler:', error.message);
+}
+
+// macOS delivers a wiredog:// link as an 'open-url' event, to the running app or, on a cold start, as
+// the event that launches it (before the app is ready). Hold an early one until the window exists.
+let launchCallbackUrl = null;
+let appIsReady = false;
+app.on('open-url', (event, url) => {
+  event.preventDefault();
+  if (!appIsReady) {
+    launchCallbackUrl = url;
+    return;
+  }
+  sso.handleCallbackUrl(url);
+  if (mainWindow) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  }
+});
 
 /**
  * Create the main application window
@@ -176,13 +241,8 @@ function createMainWindow() {
   });
 
   // Handle renderer process crashes
-  mainWindow.webContents.on('render-process-gone', async (event, details) => {
-    log.error('Renderer process crashed:', details);
-    try {
-      await vpnService.cleanup();
-    } catch (error) {
-      log.error('VPN cleanup failed after crash:', error);
-    }
+  mainWindow.webContents.on('render-process-gone', (event, details) => {
+    recoverCrashedWindow(mainWindow, 'Main window', details);
   });
 
   mainWindow.webContents.on('unresponsive', () => {
@@ -378,13 +438,8 @@ function createCompactWindow() {
   });
 
   // Handle renderer process crashes
-  compactWindow.webContents.on('render-process-gone', async (event, details) => {
-    log.error('Compact window renderer crashed:', details);
-    try {
-      await vpnService.cleanup();
-    } catch (error) {
-      log.error('VPN cleanup failed after crash:', error);
-    }
+  compactWindow.webContents.on('render-process-gone', (event, details) => {
+    recoverCrashedWindow(compactWindow, 'Compact window', details);
   });
 
   // Intercept reload shortcuts in compact window
@@ -606,15 +661,12 @@ function setupIpcHandlers() {
   });
 
   // VPN operations
-  ipcMain.handle('vpn:connect', async (event, { serverId, settings }) => {
-    log.info(`VPN connect request: ${serverId}`);
+  ipcMain.handle('vpn:connect', async (event, { serverId, settings, gatewayId }) => {
+    log.info(`VPN connect request: ${serverId}${gatewayId ? ` (gateway ${gatewayId})` : ''}`);
 
-    // Skip the pre-connect policy check when reconnecting from persistentBlock —
-    // HTTPS is guaranteed blocked by pf rules, so the fetch would just time out.
-    if (vpnService.killSwitchState === 'persistentBlock') {
-      log.info('[Update] Pre-connect: skipped (persistentBlock — HTTPS blocked by kill switch)');
-    } else {
-    // Pre-connect policy check
+    {
+    // Pre-connect policy check. Under a block it goes through the Rescue Relay (see apiRelay), and a
+    // failed fetch is fail-open, capped at 10 s.
     log.info('[Update] Pre-connect policy check before VPN connection');
     try {
       const policy = await checkUpdatePolicy();
@@ -644,8 +696,15 @@ function setupIpcHandlers() {
 
     try {
       const token = decryptSecret(settingsStore.get('authToken'));
-      const result = await vpnService.connect(serverId, settings, token);
+      const result = await vpnService.connect(serverId, settings, token, gatewayId ?? null);
+      // Save last connected server for auto-connect. The gateway (an organization's named Dedicated
+      // IP) is stored next to it so auto-connect goes back through the same one.
       settingsStore.set('lastServerId', serverId);
+      if (gatewayId) {
+        settingsStore.set('lastGatewayId', gatewayId);
+      } else {
+        settingsStore.delete('lastGatewayId');
+      }
       settingsStore.set('lastSession', result);
       return result;
     } catch (error) {
@@ -676,6 +735,9 @@ function setupIpcHandlers() {
   });
 
   ipcMain.handle('vpn:get-status', async () => {
+    // At launch the screen asks before the helper has answered; without this wait it is told "no block"
+    // and its first backend request goes out directly against a block (and hangs) instead of via the relay.
+    await vpnService.waitUntilReady(6000);
     const status = await vpnService.getFullStatus();
     if (status.status === 'connected') {
       const lastSession = settingsStore.get('lastSession');
@@ -796,7 +858,10 @@ function setupIpcHandlers() {
   ipcMain.handle('auth:set-token', (event, token) => {
     try {
       settingsStore.set('authToken', encryptSecret(token));
-      log.info('Auth token stored (Keychain-encrypted)');
+      log.info(`Auth token stored (Keychain-encrypted; ${apiRelay.describeJwtTimes(token)})`);
+      // A new login settles an earlier "login expired" report; left set, the next status update would
+      // send the user back to sign-in again.
+      vpnService.authExpired = false;
       return { success: true };
     } catch (error) {
       log.error('Failed to store auth token:', error);
@@ -804,8 +869,25 @@ function setupIpcHandlers() {
     }
   });
 
-  ipcMain.handle('auth:get-token', () => {
-    return decryptSecret(settingsStore.get('authToken'));
+  ipcMain.handle('auth:get-token', async () => {
+    const stored = settingsStore.get('authToken');
+    if (!stored) return null;
+    // A plaintext token from an old version (a JWT) needs no Keychain.
+    if (/^eyJ[\w-]+\.[\w-]+\.[\w-]*$/.test(stored)) return stored;
+    // Right after login (a reboot, a login-item launch) the Keychain can be slow or not ready. A failed
+    // read used to hand the encrypted text back as if it were the token, so the app judged the session
+    // invalid and showed the sign-in screen. Retry for a few seconds before giving up.
+    for (let attempt = 1; attempt <= 6; attempt++) {
+      try {
+        if (safeStorage.isEncryptionAvailable()) {
+          return safeStorage.decryptString(Buffer.from(stored, 'base64'));
+        }
+      } catch (err) {
+        if (attempt === 6) log.warn(`Keychain read failed after ${attempt} attempts: ${err.message}`);
+      }
+      if (attempt < 6) await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    return decryptSecret(stored);
   });
 
   ipcMain.handle('auth:clear-token', () => {
@@ -967,9 +1049,35 @@ function setupIpcHandlers() {
     }
   });
 
+  // The renderer's fetch() cannot reach the Rescue Relay, so it asks the main process to make that one
+  // request. Only the configured API host is ever contacted (see apiRelay.relayForRenderer).
+  ipcMain.handle('api:relay-request', async (_event, request) => apiRelay.relayForRenderer(request || {}));
+
+  // Business SSO: browser sign-in, resolved by the wiredog://sso callback
+  ipcMain.handle('sso:authenticate', async (_, domain) => {
+    if (typeof domain !== 'string' || !/^[a-z0-9.-]+$/i.test(domain)) {
+      throw new Error('SSO_FAILED');
+    }
+    return sso.authenticate(getApiBaseUrl(), domain.toLowerCase());
+  });
+
+  ipcMain.handle('sso:cancel', () => {
+    sso.cancel();
+  });
+
+  // Published Privacy Policy / Terms of Service versions. null when unavailable (fail open).
+  ipcMain.handle('legal:get-config', async () => {
+    return fetchLegalVersions();
+  });
+
   // Latency measurement
   ipcMain.handle('latency:measure-servers', async (_, servers) => {
     try {
+      // Probes made with the tunnel up (or coming up) are routed through the connected server, which
+      // inflates every server's latency. Only measure while genuinely disconnected.
+      if (!(await vpnService.isIdleForLatency())) {
+        return {};
+      }
       const latency = require('./latency');
       return await latency.measureAll(servers);
     } catch (error) {
@@ -1011,6 +1119,9 @@ async function initializeSettingsStore() {
         killSwitch: false,
         autoConnect: false,
         automaticUpdates: true,
+        autoStart: true,
+        autoStartMode: 'open',
+        reconnectToAnotherServer: true,
         splitTunneling: {
           enabled: false,
           mode: 'exclude',
@@ -1033,6 +1144,18 @@ async function initializeSettingsStore() {
     try { vpnService.setAuthTokenProvider(() => decryptSecret(settingsStore.get('authToken'))); } catch (err) {
       log.warn('VPN: setAuthTokenProvider failed:', err.message);
     }
+    // Rescue Relay: addresses the backend publishes for clients whose kill switch blocks the network.
+    // Loaded from the store and handed to the helper so the block keeps them reachable.
+    try {
+      apiRelay.init({
+        store: settingsStore,
+        push: (ips) => require('./ipc/service-client').request('setApiRelays', { ips })
+          .then((result) => { log.info(`[Relay] helper applied ${result?.applied ?? '?'} relay address(es) to the firewall rules`); return result; }),
+        apiBaseUrl: getApiBaseUrl(),
+      });
+    } catch (err) {
+      log.warn('Relay: init failed:', err.message);
+    }
     log.info('Settings store initialized');
   } catch (error) {
     log.error('Failed to initialize settings store:', error);
@@ -1043,8 +1166,6 @@ async function initializeSettingsStore() {
 /**
  * App update system
  */
-const https = require('https');
-const http = require('http');
 const { spawn } = require('child_process');
 
 function getApiBaseUrl() {
@@ -1052,22 +1173,13 @@ function getApiBaseUrl() {
     || (isDev ? 'http://localhost:3001/api' : 'https://api.wiredogvpn.com/api');
 }
 
-function fetchJson(url, { timeoutMs = 5000 } = {}) {
-  return new Promise((resolve, reject) => {
-    const client = url.startsWith('https') ? https : http;
-    const req = client.get(url, (res) => {
-      let data = '';
-      res.on('data', (chunk) => data += chunk);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch { reject(new Error('Invalid JSON')); }
-      });
-    });
-    req.setTimeout(timeoutMs, () => {
-      req.destroy(new Error(`fetchJson timeout after ${timeoutMs}ms`));
-    });
-    req.on('error', reject);
-  });
+// Goes through apiRelay.apiFetch so the update/relay-list check still works while a kill switch is
+// blocking the network (it falls back to the Rescue Relay). The cap keeps a blocked network from
+// stalling a connect that waits on the update policy.
+async function fetchJson(url, { timeoutMs = 5000 } = {}) {
+  const response = await apiRelay.apiFetch(url, { signal: AbortSignal.timeout(timeoutMs), headers: { Connection: 'close' } });
+  try { return await response.json(); }
+  catch { throw new Error('Invalid JSON'); }
 }
 
 async function checkUpdatePolicy() {
@@ -1076,6 +1188,8 @@ async function checkUpdatePolicy() {
   try {
     // 10s timeout — kill switch can block all traffic and a shorter timeout causes false negatives
     const config = await fetchJson(url, { timeoutMs: 10000 });
+    // Absent (older backend) leaves the saved list alone; an empty list switches the relay off.
+    if (Array.isArray(config.apiRelays)) apiRelay.setRelays(config.apiRelays);
     const platformKeys = Object.keys(config.platforms || {});
     log.info(`[Update] app/config response — top-level maintenanceMode:${config.maintenanceMode} platformKeys:[${platformKeys.join(', ')}]`);
 
@@ -1110,6 +1224,24 @@ async function checkUpdatePolicy() {
     return policy;
   } catch (error) {
     log.error(`[Update] Failed to fetch app config from ${url}: ${error.message}`);
+    return null;
+  }
+}
+
+async function fetchLegalVersions() {
+  try {
+    const config = await fetchJson(`${getApiBaseUrl()}/app/config`, { timeoutMs: 10000 });
+    const legal = config.legal;
+    if (legal && typeof legal.privacyVersion === 'string' && typeof legal.termsVersion === 'string') {
+      return {
+        privacyVersion: legal.privacyVersion,
+        termsVersion: legal.termsVersion,
+        summary: typeof legal.summary === 'string' ? legal.summary : null,
+      };
+    }
+    return null;
+  } catch (error) {
+    log.warn(`[Legal] Could not fetch legal versions: ${error.message}`);
     return null;
   }
 }
@@ -1337,6 +1469,11 @@ function setupUpdateSystem() {
 // App lifecycle
 // ================================
 app.whenReady().then(async () => {
+  // Sleep/wake (lid close): record it, so a tunnel that is dead after a wake-up can be read against
+  // the sleep that caused it, and let the VPN service recover (see VPNService.handleResume).
+  powerMonitor.on('suspend', () => vpnService.handleSuspend());
+  powerMonitor.on('resume', () => vpnService.handleResume());
+
   log.info('Electron app ready (macOS)');
   await initializeSettingsStore();
   setupIpcHandlers();
@@ -1350,6 +1487,14 @@ app.whenReady().then(async () => {
   createMainWindow();
   createTray();
   createMenu();
+
+  appIsReady = true;
+  if (launchCallbackUrl) {
+    // Nothing is waiting for it after a cold start (a sign-in always starts inside the running
+    // app), so this is dropped by handleCallbackUrl; kept so a stray link is logged, not lost silently.
+    sso.handleCallbackUrl(launchCallbackUrl);
+    launchCallbackUrl = null;
+  }
 
   // Tell the renderer when the system extension needs one-time user approval.
   // macOS Security requires this for all Network Extensions distributed via Developer ID
@@ -1385,6 +1530,15 @@ app.whenReady().then(async () => {
     }).show();
   });
 
+  // Release anything a previous run owes the backend. Pure HTTP, so it must not depend on the
+  // helper daemon being reachable: a launch where the daemon had to be reinstalled (or failed to
+  // start) is exactly when a previous session is most likely to be left behind.
+  try {
+    vpnService.retryPendingDisconnects();
+  } catch (error) {
+    log.warn('VPN: pending-disconnect retry at launch failed:', error.message);
+  }
+
   // Initialize VPN service (native addon + helper daemon)
   try {
     log.info('Initializing VPN service...');
@@ -1408,7 +1562,7 @@ app.whenReady().then(async () => {
 
   // Auto-launch settings
   try {
-    const savedAutoStart = settingsStore.get('autoStart', false);
+    const savedAutoStart = settingsStore.get('autoStart', true);
     const savedAutoStartMode = settingsStore.get('autoStartMode', 'open');
     app.setLoginItemSettings({
       openAtLogin: savedAutoStart,
@@ -1438,14 +1592,23 @@ app.on('window-all-closed', () => {
   // Do nothing - tray keeps the app alive
 });
 
-app.on('before-quit', async () => {
+// Electron does not wait for an async before-quit handler, so the quit is held until the VPN
+// cleanup (tunnel down, backend slot released) has finished, bounded so a dead network can't
+// keep the app from closing. Anything that doesn't complete is retried from the
+// pending-disconnect ledger at the next launch.
+let quitCleanupDone = false;
+app.on('before-quit', (event) => {
   isQuitting = true;
+  if (quitCleanupDone) return;
+  event.preventDefault();
+  quitCleanupDone = true;
   log.info('Application quitting - cleaning up VPN');
-  try {
-    await vpnService.cleanup();
-  } catch (error) {
-    log.error('VPN cleanup failed:', error);
-  }
+  Promise.race([
+    vpnService.cleanup(),
+    new Promise((resolve) => setTimeout(resolve, 5000)),
+  ])
+    .catch((error) => log.error('VPN cleanup failed:', error))
+    .finally(() => app.quit());
 });
 
 // Handle app being opened again (e.g., from Dock)

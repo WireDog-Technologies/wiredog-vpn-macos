@@ -94,6 +94,15 @@ class JsonRpcHandler {
                 reply(errorResponse(id: id, code: -1, message: error.localizedDescription))
             }
 
+        case "setApiRelays":
+            let ips = params?["ips"] as? [String] ?? []
+            do {
+                try killSwitchState.setApiRelays(ips)
+                reply(successResponse(id: id, result: ["success": true, "applied": killSwitchState.relayCount]))
+            } catch {
+                reply(errorResponse(id: id, code: -1, message: error.localizedDescription))
+            }
+
         case "getKillSwitchState":
             reply(successResponse(id: id, result: [
                 "state": killSwitchState.state.rawValue,

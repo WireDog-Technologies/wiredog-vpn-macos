@@ -694,8 +694,8 @@ if [ "$CLEANUP" = "1" ]; then
   fi
 
   # Clear persisted kill switch state so next launch starts fresh
-  sudo rm -f /var/run/wiredog-ks-state.json 2>/dev/null || true
-  ok "Cleared /var/run/wiredog-ks-state.json (or not present)"
+  sudo rm -f /var/run/wiredog-ks-state.json /var/db/wiredog/ks-state.json 2>/dev/null || true
+  ok "Cleared the saved kill switch state (/var/db/wiredog/ks-state.json, or not present)"
 
   # Flush any stale pf rules under our anchor
   sudo pfctl -a com.wiredog.vpn -F all >/dev/null 2>&1 || true

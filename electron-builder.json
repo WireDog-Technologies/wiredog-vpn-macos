@@ -71,6 +71,12 @@
       "to": "MacOS/WireDogActivator"
     }
   ],
+  "protocols": [
+    {
+      "name": "WireDog SSO",
+      "schemes": ["wiredog"]
+    }
+  ],
   "mac": {
     "target": [
       { "target": "dmg", "arch": ["arm64"] },
