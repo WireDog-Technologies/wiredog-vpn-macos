@@ -60,8 +60,28 @@ const RESUME_GRACE_MS = 60 * 1000;
 const PROBE_INTERVAL_MS = 10 * 1000;
 const PROBE_FAILURE_THRESHOLD = 3;       // about 30-40 s of silence
 const STALE_HANDSHAKE_THRESHOLD = 2;     // consecutive checks (10 s)
-// After the tunnel starts, how long to wait for the server to answer the handshake.
-const HANDSHAKE_WAIT_MS = 10 * 1000;
+// The helper daemon is a root LaunchDaemon that an in-app update cannot replace. Its ping reports a
+// protocol number (helper/Sources/HelperProtocol.swift); a helper below this is reinstalled after an
+// update. Helpers older than the protocol field (1.1.0 and earlier) report none: those below
+// LEGACY_HELPER_OK_VERSION are stale, 1.2.0 is functionally identical to protocol 2.
+const REQUIRED_HELPER_PROTOCOL = 2;
+const LEGACY_HELPER_OK_VERSION = '1.2.0';
+
+function versionLess(a, b) {
+  const pa = String(a).split('.').map(n => parseInt(n, 10) || 0);
+  const pb = String(b).split('.').map(n => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) < (pb[i] || 0);
+  }
+  return false;
+}
+
+// Phase A: how long the system may take to bring the tunnel up (status connecting -> connected).
+// Measured worst case on a slow Mac was 21.6 s. A backstop against a true hang, not the normal path.
+const TUNNEL_UP_WAIT_MS = 60 * 1000;
+// Phase B: once the tunnel reports connected, how long to wait for the server to answer the handshake.
+// WireGuard retries an unanswered handshake only about every 5 s, so 10 s allowed just two attempts.
+const HANDSHAKE_WAIT_MS = 30 * 1000;
 // The system reports 'disconnected' for a moment while a tunnel is starting; only a status that
 // stays there this long means the extension is not coming up.
 const TUNNEL_START_GRACE_MS = 2000;
@@ -548,6 +568,7 @@ class VPNService {
         log.info('VPN: Helper daemon connected (version: %s)', ping.version);
         this.helperConnected = true;
         this.helperVersion = ping.version || null;
+        this.helperProtocol = ping.protocol ?? null;
         apiRelay.resend();
 
         await this._checkHelperVersionMismatch();
@@ -582,6 +603,10 @@ class VPNService {
 
         // Crash recovery: release a session the previous app instance never released.
         await this._recoverStaleSession('helper connected');
+
+        // An in-app update leaves the old helper process running. Replace it now, if nothing is active.
+        this._helperUpdatePromise = this._updateHelperIfNeeded();
+        this._helperUpdatePromise.catch(() => {});
       } catch (error) {
         log.warn('VPN: Helper daemon not available:', error.message);
         this.helperConnected = false;
@@ -747,6 +772,11 @@ class VPNService {
    * @returns {Promise<boolean>}
    */
   async ensureHelperAvailable() {
+    // A helper update started at launch (admin prompt) must finish before we use the helper.
+    if (this._helperUpdatePromise) await this._helperUpdatePromise.catch(() => {});
+    if (this.helperConnected && this.helperNeedsUpdate && !this._helperUpdateAttempted) {
+      await this._updateHelperIfNeeded();
+    }
     if (this.helperConnected) return true;
 
     // Always reinstall — launchctl kickstart requires root (we don't have it),
@@ -1796,17 +1826,52 @@ class VPNService {
   }
 
   /**
-   * Check if the helper daemon version mismatches the app version.
+   * Whether the running helper is too old for this app. Compares the helper protocol number, not the app
+   * version, so a release that did not change the helper never asks for an admin password.
    */
   async _checkHelperVersionMismatch() {
     if (!this.helperVersion) return;
 
-    const appVersion = app.getVersion();
-    if (this.helperVersion !== appVersion) {
-      log.warn(`VPN: Helper daemon version mismatch — helper: ${this.helperVersion}, app: ${appVersion}`);
-      this.helperNeedsUpdate = true;
-    } else {
-      this.helperNeedsUpdate = false;
+    const stale = this.helperProtocol != null
+      ? this.helperProtocol < REQUIRED_HELPER_PROTOCOL
+      : versionLess(this.helperVersion, LEGACY_HELPER_OK_VERSION);
+    if (stale) {
+      log.warn(`VPN: Helper daemon is outdated — helper: ${this.helperVersion} (protocol ${this.helperProtocol ?? 'none'}), app: ${app.getVersion()} (needs protocol ${REQUIRED_HELPER_PROTOCOL})`);
+    }
+    this.helperNeedsUpdate = stale;
+  }
+
+  /** True while a tunnel or any kill switch / block is in effect: replacing the helper would drop it. */
+  _isProtectionActive() {
+    if (this.killSwitchState && this.killSwitchState !== 'disabled') return true;
+    try {
+      const status = this._getNativeAddon()?.getStatus?.();
+      if (status === 'connected' || status === 'connecting' || status === 'reasserting') return true;
+    } catch { /* unknown: treat as idle */ }
+    return false;
+  }
+
+  /**
+   * Reinstall a stale helper (one admin prompt). Once per launch; never while a tunnel or block is up.
+   * A canceled or failed prompt leaves the old helper in place and the app keeps working.
+   */
+  async _updateHelperIfNeeded() {
+    if (!this.helperNeedsUpdate || this._helperUpdateAttempted || !app.isPackaged) return;
+    if (this._isProtectionActive()) {
+      log.info('VPN: Helper update postponed — a tunnel or kill switch is active');
+      return;
+    }
+    this._helperUpdateAttempted = true;
+    log.info('VPN: Updating the helper daemon after an app update');
+    try {
+      await this.installHelper();
+      const ping = await serviceClient.ping();
+      this.helperVersion = ping.version || null;
+      this.helperProtocol = ping.protocol ?? null;
+      await this._checkHelperVersionMismatch();
+      log.info(`VPN: Helper daemon updated (version: ${this.helperVersion}, protocol ${this.helperProtocol ?? 'none'})`);
+    } catch (err) {
+      log.warn('VPN: Helper update failed or was canceled, continuing with the old helper:', err.message);
     }
   }
 
@@ -2220,11 +2285,15 @@ class VPNService {
    *    happened fails the attempt.
    */
   async _verifyHandshake(sinceMs, abortToken, addon) {
-    const deadline = Date.now() + HANDSHAKE_WAIT_MS;
+    // Phase A (system brings the tunnel up) and Phase B (server answers the handshake) have separate
+    // clocks: a slow Mac or network can spend 12-21 s in Phase A alone.
+    let connectedAtMs = null;
+    const upDeadline = sinceMs + TUNNEL_UP_WAIT_MS;
+    const deadline = () => (connectedAtMs === null ? upDeadline : connectedAtMs + HANDSHAKE_WAIT_MS);
     let sawReadable = false;
     let disconnectedSince = null;
     let lastStatus = 'unknown';
-    while (Date.now() < deadline) {
+    while (Date.now() < deadline()) {
       if (abortToken.cancelled) {
         this._tearDownDeadTunnel();
         throw new ConnectCancelledError();
@@ -2241,20 +2310,39 @@ class VPNService {
         disconnectedSince = null;
       }
 
-      const result = await health.hasRecentHandshake(sinceMs);
-      if (result === true) {
-        log.info(`Handshake confirmed ${Date.now() - sinceMs}ms after the tunnel started (status=${lastStatus})`);
-        return;
+      if (lastStatus === 'connected' && connectedAtMs === null) {
+        connectedAtMs = Date.now();
+        log.info(`VPN: Tunnel up after ${connectedAtMs - sinceMs}ms, waiting for the server handshake`);
       }
-      if (result === false) sawReadable = true;
 
-      // The tunnel is up but the snapshot has never been readable: nothing more to learn by waiting.
-      if (!sawReadable && lastStatus === 'connected' && Date.now() - sinceMs >= UNREADABLE_SNAPSHOT_GIVEUP_MS) {
-        log.warn('Handshake state unknown (tunnel health snapshot not reachable from the app) — not failing the connect');
-        return;
+      // Phase A: the extension serves nothing until it is up, so do not poll its snapshot yet.
+      if (connectedAtMs !== null) {
+        const result = await health.hasRecentHandshake(sinceMs);
+        if (result === true) {
+          log.info(`Handshake confirmed ${Date.now() - sinceMs}ms after the tunnel started (tunnel up ${connectedAtMs - sinceMs}ms, handshake ${Date.now() - connectedAtMs}ms later, status=${lastStatus})`);
+          return;
+        }
+        if (result === false) sawReadable = true;
+
+        // The tunnel is up but the snapshot has never been readable: nothing more to learn by waiting.
+        // Measured from connectedAtMs: from sinceMs it would fire at once on a slow Mac.
+        if (!sawReadable && lastStatus === 'connected' && Date.now() - connectedAtMs >= UNREADABLE_SNAPSHOT_GIVEUP_MS) {
+          log.warn('Handshake state unknown (tunnel health snapshot not reachable from the app) — not failing the connect');
+          return;
+        }
       }
       await new Promise(r => setTimeout(r, 250));
     }
+
+    // Phase A ran out: the system never reported connected. Not marked serverSide, so a healthy server
+    // is not excluded from the reconnect attempts.
+    if (connectedAtMs === null) {
+      log.error(`VPN: The tunnel was still '${lastStatus}' after ${TUNNEL_UP_WAIT_MS}ms`);
+      const err = new Error('The VPN tunnel is taking too long to start. Check your internet connection and try again.');
+      err.serverSide = false;
+      throw err;
+    }
+
     if (!sawReadable && lastStatus === 'connected') {
       log.warn('Handshake state unknown (tunnel health snapshot not reachable from the app) — not failing the connect');
       return;

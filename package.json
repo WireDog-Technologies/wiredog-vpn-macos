@@ -1,7 +1,7 @@
 {
   "name": "wiredog-vpn-macos",
   "private": true,
-  "version": "1.2.0",
+  "version": "1.2.1",
   "buildNumber": 3,
   "description": "WireDog VPN — Privacy, Freedom, Trust",
   "main": "electron/main.js",

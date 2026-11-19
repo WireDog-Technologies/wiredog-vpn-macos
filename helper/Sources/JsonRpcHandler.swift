@@ -32,6 +32,7 @@ class JsonRpcHandler {
         case "ping":
             reply(successResponse(id: id, result: [
                 "version": HelperVersion.current,
+                "protocol": HelperProtocol.current,
                 "uptime": ProcessInfo.processInfo.systemUptime
             ]))
 

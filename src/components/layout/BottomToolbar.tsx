@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { Loader2, ArrowDown, ArrowUp, Server, Activity, Signal } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ServerLocation, isDedicatedServer } from '@/types/vpn';
@@ -123,6 +123,15 @@ const BottomToolbar: React.FC<BottomToolbarProps> = ({
 }) => {
   const displayServer = isConnected ? connectedServer : selectedServer;
 
+  // After a few seconds of connecting, tell the user it is still working (slow Macs take 12-21 s).
+  const [stillConnecting, setStillConnecting] = useState(false);
+  useEffect(() => {
+    setStillConnecting(false);
+    if (!isConnecting) return;
+    const t = setTimeout(() => setStillConnecting(true), 8000);
+    return () => clearTimeout(t);
+  }, [isConnecting]);
+
   if (!displayServer) {
     return (
       <div className="h-full rounded-xl border border-border/50 bg-background/80 backdrop-blur-xl flex items-center justify-center">
@@ -147,7 +156,9 @@ const BottomToolbar: React.FC<BottomToolbarProps> = ({
           />
           <div className="flex-1 min-w-0">
             <p className="font-semibold text-sm leading-tight truncate">{displayServer.city ?? 'Unknown'}</p>
-            <p className="text-[11px] text-muted-foreground leading-tight">{displayServer.state ?? 'Unknown'}</p>
+            <p className="text-[11px] text-muted-foreground leading-tight">
+              {isConnecting && stillConnecting ? 'Still connecting, this can take a moment on slower connections' : (displayServer.state ?? 'Unknown')}
+            </p>
           </div>
           {isConnecting ? (
             <Button
