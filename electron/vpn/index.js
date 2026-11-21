@@ -10,6 +10,7 @@ const serviceClient = require('../ipc/service-client');
 const { buildAllowedIPs } = require('../utils/cidrUtils');
 const health = require('./health');
 const apiRelay = require('../apiRelay');
+const vdm = require('../diagnostics');
 
 // Thrown when a connect() attempt is aborted via cancelConnect() (user tapped Connect again
 // while connecting/reconnecting). Distinguished from a real failure so callers can skip
@@ -87,6 +88,14 @@ const HANDSHAKE_WAIT_MS = 30 * 1000;
 const TUNNEL_START_GRACE_MS = 2000;
 // With the tunnel up but no health snapshot ever readable, stop waiting for one after this long.
 const UNREADABLE_SNAPSHOT_GIVEUP_MS = 4000;
+// macOS takes several seconds to finish tearing a tunnel down after stopVPNTunnel (measured 8 to 9 s on
+// a slow Mac). A start requested before that finishes is dropped by the system, so disconnect() waits for
+// the real teardown, and connect() waits for any teardown still in progress before starting a new tunnel.
+const DISCONNECT_SETTLE_MAX_MS = 12 * 1000;
+const PREVIOUS_TUNNEL_WAIT_MAX_MS = 15 * 1000;
+// A first connect that fails in a way a fresh attempt can fix (the server never answered, or the tunnel
+// stopped while starting) is retried this many times, quietly, before the user sees an error.
+const FIRST_CONNECT_RETRIES = 1;
 
 // Extract the UDP port from an endpoint string like "1.2.3.4:443" or "host:443".
 function extractEndpointPort(endpoint) {
@@ -243,6 +252,40 @@ class VPNService {
     this._probeAnsweredServers = new Set();
     this._probeEverAnswered = false;
     this._connectedAtMs = 0;
+    // Latest result from the system extension activation (ACTIVATED, PENDING, ERROR: ...). Lets a tunnel
+    // that stops while starting be explained correctly instead of always blaming extension approval.
+    this._sysextState = null;
+    // Listeners for connect/disconnect progress (the screen shows it as text under the status).
+    this._stageCallbacks = [];
+    // The Verbose Diagnostic Mode attempt being tracked (null when VDM is off).
+    this._vdmId = null;
+
+    vdm.setProviders({
+      getTunnelStatus: () => this._getNativeAddon()?.getStatus?.(),
+      readHealth: () => health.readTunnelHealth(),
+      apiBaseUrl: () => this.apiBaseUrl,
+      versions: () => ({ helperVersion: this.helperVersion, helperProtocol: this.helperProtocol, systemExtension: this._sysextState }),
+      describeState: () => ({
+        systemStatus: (() => { try { return this._getNativeAddon()?.getStatus?.(); } catch { return 'unknown'; } })(),
+        killSwitchState: this.killSwitchState,
+        helperConnected: this.helperConnected,
+        helperVersion: this.helperVersion,
+        tunnelManagerLoaded: this.tunnelManagerLoaded,
+        systemExtension: this._sysextState,
+        currentServerId: this.currentServerId,
+        hasSession: !!this.currentSession,
+        isReconnecting: this.isReconnecting,
+        reconnectAttempts: this.reconnectAttempts,
+        settings: {
+          killSwitch: !!this.settings?.killSwitch,
+          permanentKillSwitch: !!this.settings?.permanentKillSwitch,
+          ipv6Enabled: this.settings?.ipv6Enabled,
+          splitTunneling: !!this.settings?.splitTunneling?.enabled,
+          blockAds: this.settings?.blockAdsEnabled,
+          blockMalware: this.settings?.blockMalwareEnabled,
+        },
+      }),
+    });
 
     log.info('VPN Service initialized (macOS)');
     log.info('API Base URL:', this.apiBaseUrl);
@@ -869,6 +912,7 @@ class VPNService {
       // following a PENDING. See native-sysext/src/sysext_activate.mm.
       sysextAddon.activate('com.wiredog.vpn.macos.tunnel', (result) => {
         log.info('VPN: System extension activation result:', result);
+        this._sysextState = String(result);
         if (result === 'PENDING') {
           wasPending = true;
           this._notifyExtensionNeedsApproval();
@@ -978,7 +1022,7 @@ class VPNService {
 
     this._connectingServerId = serverId;
     this._connectingGatewayId = gatewayId;
-    const attempt = this._connect(serverId, settings, token, gatewayId);
+    const attempt = this._connectWithRetry(serverId, settings, token, gatewayId);
     this._connectPromise = attempt;
     try {
       return await attempt;
@@ -987,8 +1031,102 @@ class VPNService {
         this._connectPromise = null;
         this._connectingServerId = null;
         this._connectingGatewayId = null;
+        this._emitStage('idle');
       }
     }
+  }
+
+  /**
+   * One user-started connect, with a quiet retry. A failure a fresh attempt can fix (the server did not
+   * answer the handshake, or the tunnel stopped while starting) is retried with a new session before the
+   * user sees an error, while the screen keeps showing Connecting. The auto-reconnect loop has its own
+   * retries (backoff, other servers), so its attempts are not retried here.
+   */
+  async _connectWithRetry(serverId, settings, token, gatewayId) {
+    const retries = this.isReconnecting ? 0 : FIRST_CONNECT_RETRIES;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this._connect(serverId, settings, token, gatewayId);
+      } catch (error) {
+        if (attempt >= retries || !error?.retryable || this.userInitiatedDisconnect || this.isReconnecting) throw error;
+        log.warn(`VPN: Connect attempt ${attempt + 1} failed (${error.message}), retrying with a new session`);
+        this._emitStage('retrying', { reason: error.message });
+        // The failed attempt's session release is on its way; at the device limit the new /vpn/connect is
+        // refused until it lands, so give it a moment (the auto-reconnect loop does the same).
+        await Promise.race([
+          this.retryPendingDisconnects({ immediate: true }),
+          new Promise((resolve) => setTimeout(resolve, RELEASE_WAIT_MS)),
+        ]);
+        // A cancel during this pause lands on the finished attempt's token (the next attempt makes a new
+        // one), so check it here or the cancel would be lost.
+        if (this._connectAbortToken?.cancelled) throw new ConnectCancelledError();
+        if (this.userInitiatedDisconnect) throw error;
+      }
+    }
+  }
+
+  /** Registers a listener for connect/disconnect progress: (stage, detail) with stage one of
+   *  waiting-for-previous, preparing, starting-tunnel, waiting-for-server, retrying, disconnecting, idle. */
+  onConnectStage(callback) {
+    this._stageCallbacks.push(callback);
+  }
+
+  _emitStage(stage, detail = {}) {
+    if (this._vdmId) vdm.stage(this._vdmId, `UI stage: ${stage}`, detail);
+    for (const cb of this._stageCallbacks) {
+      try { cb(stage, detail); } catch (err) { log.warn('VPN: stage listener failed:', err.message); }
+    }
+  }
+
+  /**
+   * Waits until the system reports the tunnel fully down ('disconnected' or 'invalid'), up to maxMs.
+   * Returns true when it is down. macOS drops a start that arrives while the previous tunnel is still
+   * 'disconnecting', which made a quick reconnect or server switch fail.
+   */
+  async _waitForTunnelDown(maxMs, reason) {
+    const addon = this._getNativeAddon();
+    if (!addon?.getStatus) return true;
+    const read = () => { try { return addon.getStatus() || 'disconnected'; } catch { return 'unknown'; } };
+    const startedAt = Date.now();
+    let status = read();
+    if (status === 'disconnected' || status === 'invalid') return true;
+    log.info(`VPN: waiting for the system to finish stopping the tunnel (${reason}, status '${status}')`);
+    while (Date.now() - startedAt < maxMs) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      status = read();
+      if (status === 'disconnected' || status === 'invalid') {
+        log.info(`VPN: tunnel fully stopped after ${Date.now() - startedAt}ms (${reason})`);
+        return true;
+      }
+    }
+    log.warn(`VPN: tunnel still '${status}' after ${maxMs}ms (${reason})`);
+    return false;
+  }
+
+  /**
+   * Before a new tunnel is started: make sure no other one is still up or stopping. A tunnel the app no
+   * longer tracks (left over from a failed attempt, or still tearing down after a disconnect) is stopped
+   * and waited for. Throws an accurate error if the system never lets go of it.
+   */
+  async _ensureTunnelIdle(abortToken) {
+    const addon = this._getNativeAddon();
+    if (!addon?.getStatus) return;
+    let status;
+    try { status = addon.getStatus(); } catch { return; }
+    if (!status || status === 'disconnected' || status === 'invalid') return;
+    this._emitStage('waiting-for-previous', { status });
+    if (status !== 'disconnecting') {
+      log.warn(`VPN: a tunnel is still '${status}' before a new connect, stopping it first`);
+      try { addon.stopTunnel(); } catch (err) { log.warn('VPN: stopTunnel failed:', err.message); }
+    }
+    const down = await this._waitForTunnelDown(PREVIOUS_TUNNEL_WAIT_MAX_MS, 'before connect');
+    if (abortToken.cancelled) throw new ConnectCancelledError();
+    if (!down) {
+      const err = new Error('The previous VPN connection is still shutting down. Please try again in a moment.');
+      err.serverSide = false;
+      throw err;
+    }
+    this._emitStage('preparing');
   }
 
   /**
@@ -1004,9 +1142,26 @@ class VPNService {
     }
   }
 
+  /** One connect attempt, recorded start to finish by Verbose Diagnostic Mode when it is on. */
   async _connect(serverId, settings, token = '', gatewayId = null) {
+    const vdmId = vdm.beginAttempt('connect', { serverId, gatewayId, reconnecting: this.isReconnecting, reconnectAttempt: this.reconnectAttempts });
+    this._vdmId = vdmId;
+    try {
+      const result = await this._connectAttempt(serverId, settings, token, gatewayId);
+      vdm.endAttempt(vdmId, 'ok');
+      return result;
+    } catch (error) {
+      vdm.endAttempt(vdmId, error instanceof ConnectCancelledError ? 'cancelled' : 'failed', error);
+      throw error;
+    } finally {
+      if (this._vdmId === vdmId) this._vdmId = null;
+    }
+  }
+
+  async _connectAttempt(serverId, settings, token = '', gatewayId = null) {
     log.info(`VPN: Connect request to server ${serverId}${gatewayId ? ` (gateway ${gatewayId})` : ''} (heldSession=${this._short(this.currentSession?.sessionId)}, configSession=${this._short(this.lastConnectionConfig?.sessionId)}, reconnecting=${this.isReconnecting})`);
     this.settings = settings;
+    this._emitStage('preparing');
 
     // Cooperative cancellation token for this specific attempt — cancelConnect() flips
     // .cancelled on whatever token is current; checked at the same two checkpoints iOS uses
@@ -1019,6 +1174,7 @@ class VPNService {
     if (!available) {
       throw new Error('Helper daemon is required for VPN. Installation was canceled or failed.');
     }
+    vdm.stage(this._vdmId, 'helper ready', { helperVersion: this.helperVersion, protocol: this.helperProtocol });
 
     // Kill switch and split tunneling are mutually exclusive — enforce at service layer
     if (settings.splitTunneling?.enabled && (settings.killSwitch || settings.permanentKillSwitch)) {
@@ -1027,6 +1183,11 @@ class VPNService {
 
     // Ensure system extension is activated and tunnel manager is loaded
     await this.ensureExtensionActive();
+    vdm.stage(this._vdmId, 'extension ready', { systemExtension: this._sysextState, tunnelManagerLoaded: this.tunnelManagerLoaded });
+
+    // A tunnel still stopping (a disconnect or server switch a moment ago) or left over from a failed
+    // attempt would make macOS drop the start below. Wait for it before claiming a session.
+    await this._ensureTunnelIdle(abortToken);
 
     this.connectedSince = null;
     this.authExpired = false;
@@ -1088,12 +1249,15 @@ class VPNService {
           blockMalware: settings.blockMalwareEnabled ?? true,
         };
         if (gatewayId) requestPayload.dedicatedIpId = gatewayId;
+        const requestedAt = Date.now();
+        vdm.stage(this._vdmId, 'POST /vpn/connect sent');
         response = await this._fetch(`${this.apiBaseUrl}/vpn/connect`, {
           method: 'POST',
           headers,
           credentials: 'include',
           body: JSON.stringify(requestPayload),
         });
+        vdm.stage(this._vdmId, `POST /vpn/connect answered HTTP ${response.status} in ${Date.now() - requestedAt}ms`);
 
         if (!response.ok) {
           const error = await response.json().catch(() => ({ error: 'Unknown error' }));
@@ -1152,6 +1316,21 @@ class VPNService {
       // last address this host resolved to: right after the network returns DNS can fail for a while.
       const resolvedServerIp = await this._resolveServerIp(config.endpoint);
       const serverPort = extractEndpointPort(config.endpoint);
+      if (this._vdmId) {
+        vdm.stage(this._vdmId, 'config', {
+          endpoint: config.endpoint,
+          resolvedServerIp,
+          address: config.address,
+          dns: config.dns,
+          allowedIPs: config.allowedIPs,
+          keepalive: config.persistentKeepalive,
+          awg: !!config.awg,
+          awgShape: config.awg ? { Jc: config.awg.Jc, Jmin: config.awg.Jmin, Jmax: config.awg.Jmax, S1: config.awg.S1, S2: config.awg.S2 } : null,
+          usedCachedConfig,
+          session: this._short(sessionId),
+        });
+        vdm.preflight(this._vdmId, config.endpoint);
+      }
 
       // Transition kill switch to bootstrap state before starting tunnel. Fail closed: a connect that
       // was asked to run behind a kill switch must not carry on without one.
@@ -1220,6 +1399,8 @@ class VPNService {
       // check before starting the tunnel, mirroring iOS's Task.checkCancellation().
       if (abortToken.cancelled) throw new ConnectCancelledError();
 
+      this._emitStage('starting-tunnel');
+      vdm.stage(this._vdmId, 'calling native startTunnel', { systemStatus: (() => { try { return tunnelAddon.getStatus(); } catch { return 'unknown'; } })(), includeAllNetworks: !!settings.killSwitch });
       const tunnelStartedMs = Date.now();
       try {
       await tunnelAddon.startTunnel({
@@ -1247,6 +1428,7 @@ class VPNService {
         if (!(tunnelErr instanceof ConnectCancelledError)) tunnelErr.serverSide = true;
         throw tunnelErr;
       }
+      vdm.stage(this._vdmId, `native startTunnel resolved after ${Date.now() - tunnelStartedMs}ms (request handed to macOS, not tunnel up)`);
 
       // The tunnel just started — if a cancel landed in the narrow window right around this
       // call, tear it back down immediately rather than leaving an untracked live tunnel.
@@ -1517,6 +1699,8 @@ class VPNService {
     this.connectedSince = null;
 
     this._intentionalDisconnect = true;
+    const vdmId = vdm.beginAttempt('disconnect', { disableProtection, session: this._short(this.currentSession?.sessionId) });
+    this._emitStage('disconnecting');
     try {
       const addon = this._getNativeAddon();
       if (addon) {
@@ -1545,6 +1729,13 @@ class VPNService {
         }
       }
 
+      // Report Disconnected only once the system has really stopped the tunnel (several seconds on a
+      // slow Mac). Returning earlier let the next connect or server switch start while the old tunnel was
+      // still stopping, and macOS dropped that start. connect() also waits, as a second line of defence.
+      const teardownStartedAt = Date.now();
+      const down = await this._waitForTunnelDown(DISCONNECT_SETTLE_MAX_MS, 'disconnect');
+      vdm.stage(vdmId, `teardown ${down ? 'finished' : 'still running'} after ${Date.now() - teardownStartedAt}ms`);
+
       // Notify backend — durable cleanup (persisted + retried on failure) rather than a bare
       // fire-and-forget fetch, so a disconnect lost to a network blip doesn't leak the counter.
       if (this.currentSession) {
@@ -1570,15 +1761,18 @@ class VPNService {
         this._persistLastConnectionConfig();
       }
       log.info('VPN: Disconnected successfully');
+      vdm.endAttempt(vdmId, 'ok');
       this.notifyStatusChange();
 
     } catch (error) {
       log.error('VPN: Disconnect error:', error);
+      vdm.endAttempt(vdmId, 'failed', error);
       this.currentSession = null;
       this.notifyStatusChange();
       throw error;
     } finally {
       this._intentionalDisconnect = false;
+      this._emitStage('idle');
     }
   }
 
@@ -1948,6 +2142,7 @@ class VPNService {
    */
   _handleTunnelStatusChange(status) {
     log.info('VPN: Tunnel status changed:', status);
+    vdm.noteTunnelStatus(status);
 
     if (status === 'connected') {
       this.connectedSince = Date.now();
@@ -2012,6 +2207,7 @@ class VPNService {
    */
   _handleUnexpectedDrop() {
     log.info('VPN: Unexpected tunnel disconnect — clearing stale session');
+    vdm.noteDrop('unexpected tunnel drop');
     this._lastAttemptServerSide = false;
     this._reconnectExcluded.clear();
     this._stopHealthMonitor();
@@ -2299,12 +2495,24 @@ class VPNService {
         throw new ConnectCancelledError();
       }
 
+      const previousStatus = lastStatus;
       try { lastStatus = addon?.getStatus?.() || 'unknown'; } catch { lastStatus = 'unknown'; }
+      if (lastStatus !== previousStatus) {
+        vdm.stage(this._vdmId, `verify: system status ${previousStatus} -> ${lastStatus} at ${Date.now() - sinceMs}ms after start`);
+      }
       if (lastStatus === 'disconnected') {
         if (disconnectedSince === null) disconnectedSince = Date.now();
         if (Date.now() - disconnectedSince >= TUNNEL_START_GRACE_MS) {
-          log.error(`VPN: The tunnel did not come up (system status stayed '${lastStatus}' ${Date.now() - disconnectedSince}ms after start)`);
-          throw new Error('The VPN tunnel failed to start. Check that the WireDog network extension is approved in System Settings, then try again.');
+          log.error(`VPN: The tunnel did not come up (system status stayed '${lastStatus}' ${Date.now() - disconnectedSince}ms after start, extension ${this._sysextState || 'state unknown'})`);
+          // Only blame the extension when it is not known to be activated. An activated extension whose
+          // tunnel stops while starting (for example a start that raced a teardown) is worth a fresh try.
+          const activated = this._sysextState === 'ACTIVATED';
+          const err = new Error(activated
+            ? 'The VPN tunnel stopped while it was starting. Please try again.'
+            : 'The VPN tunnel failed to start. Check that the WireDog network extension is approved in System Settings, then try again.');
+          err.serverSide = false;
+          err.retryable = activated;
+          throw err;
         }
       } else {
         disconnectedSince = null;
@@ -2313,11 +2521,13 @@ class VPNService {
       if (lastStatus === 'connected' && connectedAtMs === null) {
         connectedAtMs = Date.now();
         log.info(`VPN: Tunnel up after ${connectedAtMs - sinceMs}ms, waiting for the server handshake`);
+        this._emitStage('waiting-for-server', { tunnelUpMs: connectedAtMs - sinceMs });
       }
 
       // Phase A: the extension serves nothing until it is up, so do not poll its snapshot yet.
       if (connectedAtMs !== null) {
         const result = await health.hasRecentHandshake(sinceMs);
+        if (this._vdmId) vdm.first(this._vdmId, `handshake check first returned ${result}`);
         if (result === true) {
           log.info(`Handshake confirmed ${Date.now() - sinceMs}ms after the tunnel started (tunnel up ${connectedAtMs - sinceMs}ms, handshake ${Date.now() - connectedAtMs}ms later, status=${lastStatus})`);
           return;
@@ -2347,8 +2557,12 @@ class VPNService {
       log.warn('Handshake state unknown (tunnel health snapshot not reachable from the app) — not failing the connect');
       return;
     }
-    const err = new Error(sawReadable ? 'The server did not answer the tunnel handshake' : 'The VPN tunnel did not come up in time');
+    const err = new Error(sawReadable
+      ? 'The server did not respond. Please try again, or choose a different location.'
+      : 'The VPN tunnel did not come up in time');
     err.serverSide = sawReadable;
+    // A server that never answered is often fine a moment later with a new session.
+    err.retryable = sawReadable;
     throw err;
   }
 

@@ -5,6 +5,7 @@ import { getCachedServerById as getServerById } from '@/lib/serverCache';
 import type { MeResponse, LoginOutcome } from '@/lib/api';
 import { transformServer, listIdFor } from '@/lib/servers';
 import { hasEntitlement, lostOrganizationAccess, organizationAccessMessage } from '@/lib/account';
+import { ConnectionTransition, ConnectStage, onConnectStage, stageText } from '@/lib/connectionProgress';
 
 interface VPNContextType {
   connection: ConnectionInfo;
@@ -12,6 +13,10 @@ interface VPNContextType {
   user: User | null;
   selectedServer: ServerLocation | null;
   isSwitchingServer: boolean;
+  // What the tunnel is in the middle of doing (null when it is settled), for the status label.
+  transition: ConnectionTransition;
+  // Progress text for the current step of a connect or disconnect, or null.
+  progressText: string | null;
   isAuthenticated: boolean;
   isAuthLoading: boolean;
   // False until the first tunnel-status read has landed, so nothing (e.g. an IP lookup) assumes
@@ -136,6 +141,15 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [isStatusResolved, setIsStatusResolved] = useState(false);
   const [advancedKillSwitchActive, setAdvancedKillSwitchActive] = useState(false);
   const [connectionError, setConnectionError] = useState<string | null>(null);
+  // The step the main process reports it is on (null when idle), whether this window started a
+  // disconnect, and whether the main process is running its auto-reconnect loop.
+  const [connectStage, setConnectStage] = useState<ConnectStage | null>(null);
+  const [isDisconnecting, setIsDisconnecting] = useState(false);
+  const [isReconnecting, setIsReconnecting] = useState(false);
+
+  useEffect(() => onConnectStage(({ stage }) => {
+    setConnectStage(stage === 'idle' ? null : stage);
+  }), []);
 
   // While a kill switch is holding the network blocked (no tunnel), backend requests go through the
   // Rescue Relay first instead of waiting out a direct attempt that cannot succeed.
@@ -272,6 +286,9 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   }, []);
 
   const disconnect = useCallback(async (options?: { disableProtection?: boolean }) => {
+    // 'connecting' keeps every control in its busy state; `transition` makes the label say DISCONNECTING.
+    // The call returns once the system has really stopped the tunnel, so the next connect cannot race it.
+    setIsDisconnecting(true);
     setConnection(prev => ({ ...prev, status: 'connecting' }));
 
     try {
@@ -285,6 +302,8 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     } catch (error) {
       console.error('VPN disconnect failed:', error);
       setConnection(defaultConnection);
+    } finally {
+      setIsDisconnecting(false);
     }
   }, []);
 
@@ -486,6 +505,7 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         if (status.advancedKillSwitchEnabled !== undefined) {
           setSettings(prev => ({ ...prev, permanentKillSwitch: status.advancedKillSwitchEnabled! }));
         }
+        setIsReconnecting(!!status.isReconnecting);
 
         // Sync connection state based on status
         if (status.status === 'connected' && status.session) {
@@ -807,6 +827,17 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setUser(null);
   }, [connection.status]);
 
+  // A switch shows as one SWITCHING step; a disconnect is recognized from this window's own call or
+  // from the main process (the compact window disconnects without going through this context).
+  const transition: ConnectionTransition = isSwitchingServer
+    ? 'switching'
+    : isDisconnecting || connectStage === 'disconnecting'
+      ? 'disconnecting'
+      : connection.status === 'connecting'
+        ? (isReconnecting ? 'reconnecting' : 'connecting')
+        : null;
+  const progressText = transition ? stageText(connectStage) : null;
+
   return (
     <VPNContext.Provider
       value={{
@@ -815,6 +846,8 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         user,
         selectedServer,
         isSwitchingServer,
+        transition,
+        progressText,
         isAuthenticated: !!user,
         isAuthLoading,
         isStatusResolved,

@@ -13,6 +13,7 @@ import { useElectron } from '@/context/ElectronContext';
 import { useGeolocation } from '@/hooks/useGeolocation';
 import { useRecommendedServers } from '@/hooks/useServers';
 import { cn } from '@/lib/utils';
+import { transitionLabel } from '@/lib/connectionProgress';
 import ReconnectDialog from '@/components/ReconnectDialog';
 import DisconnectDialog from '@/components/DisconnectDialog';
 import { openPricingPage } from "@/lib/api";
@@ -21,7 +22,7 @@ import Logo from "../../assets/logos/wiredog-minimal-navy_1024x1024.png";
 import TextLogo from "../../assets/logos/wiredog_text_logo_1024.png";
 
 const RightSidebar: React.FC = () => {
-  const { user, connection, connect, cancelConnect, disconnect, reconnect, settings, updateSettings, selectedServer, advancedKillSwitchActive, isSubscriptionActive, isSwitchingServer } = useVPN();
+  const { user, connection, connect, cancelConnect, disconnect, reconnect, settings, updateSettings, selectedServer, advancedKillSwitchActive, isSubscriptionActive, isSwitchingServer, transition, progressText } = useVPN();
   // Personal accounts without a plan are sent to the website to pick one; organization accounts are not.
   const offerSubscription = shouldOfferSubscription(user, isSubscriptionActive);
   const [showReconnectDialog, setShowReconnectDialog] = useState(false);
@@ -37,11 +38,13 @@ const RightSidebar: React.FC = () => {
   const { data: recommendedServers = [] } = useRecommendedServers();
   const defaultServer = recommendedServers[0];
 
-  const isConnected = connection.status === 'connected' && !isSwitchingServer;
+  // A disconnect in progress is not "connected" any more, even if the tunnel has not finished stopping.
+  const isDisconnecting = transition === 'disconnecting';
+  const isConnected = connection.status === 'connected' && !isSwitchingServer && !isDisconnecting;
   // Includes isSwitchingServer so the brief disconnect->connect gap mid-switch (which
   // connection.status genuinely passes through as 'disconnected') doesn't flicker the UI
   // back to an idle/connectable state.
-  const isConnecting = connection.status === 'connecting' || isSwitchingServer;
+  const isConnecting = connection.status === 'connecting' || isSwitchingServer || isDisconnecting;
   const isError = connection.status === 'error';
   // Covers connecting, disconnecting, and reconnecting (macOS reports all three as
   // 'connecting' — see VPNContext's status mapping) plus the brief window right after a
@@ -86,6 +89,8 @@ const RightSidebar: React.FC = () => {
       await openPricingPage();
       return;
     }
+    // A disconnect is already finishing; there is nothing to cancel and nothing to start yet.
+    if (isDisconnecting) return;
     if (isConnecting) {
       await cancelConnect();
       return;
@@ -161,7 +166,7 @@ const RightSidebar: React.FC = () => {
           <button
             onClick={handleConnect}
             disabled={!isConnecting && !isConnected && !isSubscriptionActive && !offerSubscription}
-            title={isConnecting ? 'Cancel connecting' : !isConnected && !isError && offerSubscription ? 'Choose a plan' : undefined}
+            title={isDisconnecting ? 'Disconnecting' : isConnecting ? 'Cancel connecting' : !isConnected && !isError && offerSubscription ? 'Choose a plan' : undefined}
             className={cn(
               "relative w-28 h-28 rounded-full flex items-center justify-center transition-all duration-300 group",
               "border-4",
@@ -181,8 +186,8 @@ const RightSidebar: React.FC = () => {
             )}>
               {isConnecting ? (
                 <>
-                  <Loader2 className="w-8 h-8 text-background animate-spin group-hover:hidden" />
-                  <X className="w-8 h-8 text-background hidden group-hover:block" />
+                  <Loader2 className={cn("w-8 h-8 text-background animate-spin", !isDisconnecting && "group-hover:hidden")} />
+                  {!isDisconnecting && <X className="w-8 h-8 text-background hidden group-hover:block" />}
                 </>
               ) : isConnected ? (
                 <Shield className="w-8 h-8 text-background" />
@@ -205,8 +210,12 @@ const RightSidebar: React.FC = () => {
           !isConnected && !isConnecting && !isError && !advancedKillSwitchActive && isSubscriptionActive && "text-accent",
           !isConnected && !isConnecting && !isError && !isSubscriptionActive && "text-accent"
         )}>
-          {isError ? "CONNECTION LOST" : isConnected ? "PROTECTED" : isConnecting ? "CONNECTING..." : advancedKillSwitchActive ? "PROTECTED (NO VPN)" : !isSubscriptionActive ? <>NO ACTIVE<br />SUBSCRIPTION</> : "UNPROTECTED"}
+          {isError ? "CONNECTION LOST" : isConnected ? "PROTECTED" : isConnecting ? transitionLabel(transition ?? 'connecting') : advancedKillSwitchActive ? "PROTECTED (NO VPN)" : !isSubscriptionActive ? <>NO ACTIVE<br />SUBSCRIPTION</> : "UNPROTECTED"}
         </p>
+        {/* What the tunnel is doing right now, so a slow connect never looks frozen. */}
+        {isConnecting && progressText && (
+          <p className="text-center text-xs text-muted-foreground mb-2">{progressText}...</p>
+        )}
 
         {/* Why the internet is blocked, and the way out. Shown only while a kill switch is holding the block. */}
         {isError && settings.killSwitch && !settings.permanentKillSwitch && (

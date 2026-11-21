@@ -49,6 +49,7 @@ if (!app.isPackaged) {
 const { BrowserWindow, ipcMain, Menu, Tray, shell, dialog, nativeImage, safeStorage, Notification, powerMonitor } = require('electron');
 const vpnService = require('./vpn');
 const apiRelay = require('./apiRelay');
+const diagnostics = require('./diagnostics');
 const sso = require('./sso');
 const { getInstalledApps, readPlist, extractAppIcon } = require('./utils/appDiscovery');
 
@@ -821,6 +822,13 @@ function setupIpcHandlers() {
     updateTrayMenu();
   });
 
+  // Connect/disconnect progress (shown as text under the status while the tunnel is changing state).
+  vpnService.onConnectStage((stage, detail) => {
+    for (const win of [mainWindow, compactWindow]) {
+      if (win && !win.isDestroyed()) win.webContents.send('vpn:connect-stage', { stage, detail });
+    }
+  });
+
   // Renderer process logging
   ipcMain.on('renderer:log', (event, { level, message }) => {
     const prefix = '[Renderer]';
@@ -843,7 +851,10 @@ function setupIpcHandlers() {
   ipcMain.handle('settings:set', (event, newSettings) => {
     try {
       const currentSettings = settingsStore.store;
-      const merged = { ...currentSettings, ...newSettings };
+      // Verbose Diagnostic Mode is owned by the diagnostics IPC. Some screens write back a whole copy of
+      // the settings they loaded earlier, which would silently undo turning it on or off.
+      const { verboseDiagnostics: _ignored, ...incoming } = newSettings || {};
+      const merged = { ...currentSettings, ...incoming };
       settingsStore.store = merged;
       const { authToken, authUser, ...safeSettings } = merged;
       log.info('Settings updated:', safeSettings);
@@ -1001,6 +1012,10 @@ function setupIpcHandlers() {
     shell.openPath(logDir);
   });
 
+  // Verbose Diagnostic Mode (Account > Debug Logs)
+  ipcMain.handle('diagnostics:get-state', () => diagnostics.getState());
+  ipcMain.handle('diagnostics:set-enabled', (_event, enabled) => diagnostics.setEnabled(!!enabled));
+
   ipcMain.handle('logs:open-service-logs', () => {
     // macOS helper daemon logs
     const serviceLogPath = '/var/log/wiredog-helper.log';
@@ -1134,6 +1149,10 @@ async function initializeSettingsStore() {
         authToken: null
       }
     });
+    // Verbose Diagnostic Mode keeps its on/off state (and when it was turned on) in the store.
+    try { diagnostics.init({ store: settingsStore }); } catch (err) {
+      log.warn('VDM: init failed:', err.message);
+    }
     // Wire the VPN service to the store so it can persist lastConnectionConfig
     // (required for cold-start auto-reconnect when persistent_block is active)
     try { vpnService.setConfigStore(settingsStore); } catch (err) {

@@ -68,7 +68,19 @@ contextBridge.exposeInMainWorld('electronAPI', {
       const handler = (_, status) => callback(status);
       ipcRenderer.on('vpn:status-changed', handler);
       return () => ipcRenderer.removeListener('vpn:status-changed', handler);
+    },
+    // Connect/disconnect progress: { stage, detail }
+    onConnectStage: (callback) => {
+      const handler = (_, data) => callback(data);
+      ipcRenderer.on('vpn:connect-stage', handler);
+      return () => ipcRenderer.removeListener('vpn:connect-stage', handler);
     }
+  },
+
+  // Verbose Diagnostic Mode (Account > Debug Logs)
+  diagnostics: {
+    getState: () => ipcRenderer.invoke('diagnostics:get-state'),
+    setEnabled: (enabled) => ipcRenderer.invoke('diagnostics:set-enabled', enabled),
   },
 
   // Network extension one-time approval flow

@@ -13,6 +13,7 @@ import {
 import Logo from '@/assets/logos/wiredog-minimal-navy_1024x1024.png';
 import TextLogo from '@/assets/logos/wiredog_text_logo_1024.png';
 import { ServerLocation } from '@/types/vpn';
+import { transitionLabel } from '@/lib/connectionProgress';
 import { Loader2, Shield, ShieldOff, X } from 'lucide-react';
 
 // Type definitions
@@ -62,7 +63,7 @@ const buildHierarchy = (servers: ServerLocation[]): HierarchyState[] => {
 
 const CompactWindow: React.FC = () => {
   const { data: servers = [], isLoading } = useServers();
-  const { connection, connect, cancelConnect, selectedServer, setSelectedServer } = useVPN();
+  const { connection, connect, cancelConnect, selectedServer, setSelectedServer, transition, progressText } = useVPN();
   const { data: geo, isFetching: isGeoFetching } = useGeolocation(connection.status);
   const [isConnecting, setIsConnecting] = useState(false);
 
@@ -87,9 +88,10 @@ const CompactWindow: React.FC = () => {
     return buildHierarchy(servers);
   }, [servers]);
 
-  // Connection status helpers
-  const isConnected = connection.status === 'connected';
-  const isConnectingState = connection.status === 'connecting' || isConnecting;
+  // Connection status helpers. A disconnect in progress is neither connected nor idle yet.
+  const isDisconnecting = transition === 'disconnecting';
+  const isConnected = connection.status === 'connected' && !isDisconnecting;
+  const isConnectingState = connection.status === 'connecting' || isConnecting || isDisconnecting;
 
   // Status colors and labels
   const statusColor = isConnected
@@ -101,7 +103,7 @@ const CompactWindow: React.FC = () => {
   const statusLabel = isConnected
     ? 'PROTECTED'
     : isConnectingState
-      ? 'CONNECTING...'
+      ? transitionLabel(transition ?? 'connecting')
       : 'UNPROTECTED';
 
   // Covers connecting/disconnecting/reconnecting plus the brief window right after a
@@ -136,6 +138,8 @@ const CompactWindow: React.FC = () => {
 
   // Handle main connection toggle button
   const handleConnect = async () => {
+    // A disconnect is already finishing; there is nothing to cancel and nothing to start yet.
+    if (isDisconnecting) return;
     if (isConnectingState) {
       await cancelConnect();
       return;
@@ -239,6 +243,9 @@ const CompactWindow: React.FC = () => {
       {/* Status Label */}
       <div className="px-4 py-2 flex-shrink-0 border-b border-slate-700">
         <p className={cn('text-sm font-bold text-center', statusColor)}>{statusLabel}</p>
+        {isConnectingState && progressText && (
+          <p className="text-xs text-slate-400 text-center mt-0.5">{progressText}...</p>
+        )}
       </div>
 
       {/* Scrollable Server List */}
