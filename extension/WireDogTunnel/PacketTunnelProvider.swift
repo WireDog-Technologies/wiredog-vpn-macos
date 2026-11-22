@@ -20,36 +20,121 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// Shared App Group container for config fallback and logging
     private let appGroupId = "group.com.wiredog.vpn.macos"
 
-    private func diagLog(_ message: String) {
-        let line = "[\(Date())] \(message)\n"
-        // 1. NSLog always goes to system log (visible via log stream)
-        NSLog("[WireDog-Ext] %@", message)
-        // 2. os_log fault (always stored, appears in Console.app)
-        logger.fault("\(message, privacy: .public)")
-        // 2. /tmp file — no entitlement needed
-        let tmpURL = URL(fileURLWithPath: "/private/tmp/wiredog-ext.log")
-        if let data = line.data(using: .utf8) {
-            if let handle = try? FileHandle(forWritingTo: tmpURL) {
-                handle.seekToEndOfFile(); handle.write(data); try? handle.close()
-            } else { try? data.write(to: tmpURL) }
+    // MARK: - Diagnostics (read by the app's Verbose Diagnostic Mode through the health snapshot)
+
+    private let processStartedAt = Date()
+    private let diagLock = NSLock()
+    private var startTunnelAt: Date?
+    private var lastStartMs: Int?
+    private var lastStopMs: Int?
+    private var diagWrites = 0
+    private var diagWriteTotalMs = 0.0
+    private var diagWriteMaxMs = 0.0
+    private var diagFileBytes = 0
+
+    /// " [+N ms since startTunnel]" while a start is in progress, so the system log shows where it spends its time.
+    private func sinceStartMarker() -> String {
+        diagLock.lock()
+        let begun = startTunnelAt
+        diagLock.unlock()
+        guard let begun = begun else { return "" }
+        return " [+\(Int(Date().timeIntervalSince(begun) * 1000))ms since startTunnel]"
+    }
+
+    /// Records the cost of one diagLog file write (both capped files). Up to extension 1.0.13 every line also
+    /// rewrote one ever-growing UserDefaults string, which could make each line slow on a Mac that had run the
+    /// extension for months; this shows what a line costs now. Reported straight to the system log (going
+    /// through diagLog would measure itself).
+    private func recordDiagWrite(ms: Double, bytes: Int) {
+        diagLock.lock()
+        diagWrites += 1
+        diagWriteTotalMs += ms
+        if ms > diagWriteMaxMs { diagWriteMaxMs = ms }
+        diagFileBytes = bytes
+        let writes = diagWrites
+        let avg = diagWriteTotalMs / Double(diagWrites)
+        let maxMs = diagWriteMaxMs
+        diagLock.unlock()
+        if writes == 1 || writes % 50 == 0 || ms > 100 {
+            NSLog("[WireDog-Ext] [Diag] log file %ld bytes; this write %.1f ms (avg %.1f ms, max %.1f ms over %ld writes)", bytes, ms, avg, maxMs, writes)
         }
-        // 3. App Group UserDefaults — append to a running log string
-        let ud = UserDefaults(suiteName: appGroupId)
-        let existing = ud?.string(forKey: "extensionDiagLog") ?? ""
-        ud?.set(existing + line, forKey: "extensionDiagLog")
-        // 4. App Group container file
+    }
+
+    /// Sizes of every place diagLog writes to (and of the legacy UserDefaults store, before it is removed),
+    /// logged at process start and at each startTunnel.
+    private func logDiagStoreSizes(_ context: String) {
+        let udBytes = UserDefaults(suiteName: appGroupId)?.string(forKey: "extensionDiagLog")?.utf8.count ?? 0
+        let tmpBytes = (try? FileManager.default.attributesOfItem(atPath: "/private/tmp/wiredog-ext.log")[.size] as? Int) ?? nil
+        var groupBytes: Int?
         if let containerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupId) {
-            let fileURL = containerURL.appendingPathComponent("extension-diag.log")
-            if let data = line.data(using: .utf8) {
-                if let handle = try? FileHandle(forWritingTo: fileURL) {
-                    handle.seekToEndOfFile(); handle.write(data); try? handle.close()
-                } else { try? data.write(to: fileURL) }
-            }
+            let path = containerURL.appendingPathComponent("extension-diag.log").path
+            groupBytes = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int) ?? nil
         }
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        NSLog("[WireDog-Ext] [Diag] %@: extension %@ (%@), pid %d, up %.0f s; legacy UserDefaults store %ld bytes, /tmp log %ld bytes, group file %ld bytes",
+              context, version, build, ProcessInfo.processInfo.processIdentifier,
+              Date().timeIntervalSince(processStartedAt), udBytes, tmpBytes ?? -1, groupBytes ?? -1)
+    }
+
+    private func diagLog(_ message: String) {
+        let since = sinceStartMarker()
+        let line = "[\(Date())] \(message)\(since)\n"
+        // 1. NSLog always goes to system log (visible via log stream)
+        NSLog("[WireDog-Ext] %@%@", message, since)
+        // 2. os_log fault (always stored, appears in Console.app)
+        logger.fault("\(message, privacy: .public)\(since, privacy: .public)")
+        // 3. Two capped files (timed: see recordDiagWrite). The old third copy, one App Group UserDefaults
+        // string that grew forever and was rewritten whole on every line, is gone (see removeLegacyDiagStore).
+        guard let data = line.data(using: .utf8) else { return }
+        let writeStarted = Date()
+        fileLock.lock()
+        let newestSize = appendCapped(data, to: URL(fileURLWithPath: "/private/tmp/wiredog-ext.log"))
+        if let containerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupId) {
+            appendCapped(data, to: containerURL.appendingPathComponent("extension-diag.log"))
+        }
+        fileLock.unlock()
+        recordDiagWrite(ms: Date().timeIntervalSince(writeStarted) * 1000, bytes: Int(newestSize))
+    }
+
+    /// Each diagnostic log file stays under this size: past it the file becomes "<name>.1" (replacing the
+    /// previous .1) and a new file starts. The newest lines are always kept and each log uses at most
+    /// twice this on disk.
+    private static let diagFileCap: UInt64 = 5 * 1024 * 1024
+    private let fileLock = NSLock()
+
+    /// Appends one line and rotates the file once it passes the cap. Returns the file's size after the write.
+    @discardableResult
+    private func appendCapped(_ data: Data, to url: URL) -> UInt64 {
+        guard let handle = try? FileHandle(forWritingTo: url) else {
+            try? data.write(to: url)
+            return UInt64(data.count)
+        }
+        let size = handle.seekToEndOfFile() + UInt64(data.count)
+        handle.write(data)
+        try? handle.close()
+        if size > Self.diagFileCap {
+            let previous = url.appendingPathExtension("1")
+            try? FileManager.default.removeItem(at: previous)
+            try? FileManager.default.moveItem(at: url, to: previous)
+        }
+        return size
+    }
+
+    /// Removes the old UserDefaults log copy once. Nothing ever read it (the app cannot reach this root
+    /// process's App Group container), and its size is logged first (logDiagStoreSizes) as evidence of
+    /// what it cost.
+    private func removeLegacyDiagStore() {
+        let ud = UserDefaults(suiteName: appGroupId)
+        guard ud?.object(forKey: "extensionDiagLog") != nil else { return }
+        ud?.removeObject(forKey: "extensionDiagLog")
+        NSLog("[WireDog-Ext] [Diag] removed the legacy extensionDiagLog UserDefaults store")
     }
 
     override init() {
         super.init()
+        logDiagStoreSizes("process start")
+        removeLegacyDiagStore()
         diagLog("=== PacketTunnelProvider init() — process started ===")
     }
 
@@ -146,12 +231,25 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 default: break
                 }
             }
-            let snapshot: [String: Any] = [
+            var snapshot: [String: Any] = [
                 "updatedAt": Int64(Date().timeIntervalSince1970),
                 "lastHandshake": lastSec,
                 "rxBytes": rx,
                 "txBytes": tx,
             ]
+            // Diagnostics for Verbose Diagnostic Mode: which extension build is running, for how long, how
+            // long the last start and stop took, and what a diagnostic log line costs.
+            self.diagLock.lock()
+            snapshot["extVersion"] = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+            snapshot["extBuild"] = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+            snapshot["extUptimeSec"] = Int(Date().timeIntervalSince(self.processStartedAt))
+            if let start = self.lastStartMs { snapshot["lastStartMs"] = start }
+            if let stop = self.lastStopMs { snapshot["lastStopMs"] = stop }
+            snapshot["diagFileBytes"] = self.diagFileBytes
+            snapshot["diagWrites"] = self.diagWrites
+            snapshot["diagWriteAvgMs"] = self.diagWrites > 0 ? (self.diagWriteTotalMs / Double(self.diagWrites) * 10).rounded() / 10 : 0
+            snapshot["diagWriteMaxMs"] = (self.diagWriteMaxMs * 10).rounded() / 10
+            self.diagLock.unlock()
             guard let data = try? JSONSerialization.data(withJSONObject: snapshot) else { return }
             self.healthQueue.async {
                 self.healthBody = data
@@ -167,8 +265,26 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func startTunnel(
         options: [String: NSObject]?,
-        completionHandler: @escaping (Error?) -> Void
+        completionHandler originalCompletion: @escaping (Error?) -> Void
     ) {
+        // Every line from here to the completion carries "+N ms since startTunnel", and the total is kept
+        // for the health snapshot, so a slow start can be read step by step.
+        let begun = Date()
+        diagLock.lock()
+        startTunnelAt = begun
+        diagLock.unlock()
+        logDiagStoreSizes("startTunnel")
+        let completionHandler: (Error?) -> Void = { [weak self] error in
+            let ms = Int(Date().timeIntervalSince(begun) * 1000)
+            self?.diagLog("startTunnel finished in \(ms) ms (\(error.map { "error: \($0.localizedDescription)" } ?? "ok"))")
+            if let self = self {
+                self.diagLock.lock()
+                self.lastStartMs = ms
+                self.startTunnelAt = nil
+                self.diagLock.unlock()
+            }
+            originalCompletion(error)
+        }
         diagLog("=== startTunnel() called ===")
         diagLog("Options provided: \(options != nil ? "yes" : "no")")
         if let opts = options { diagLog("Option keys: \(opts.keys.joined(separator: ", "))") }
@@ -337,13 +453,20 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         completionHandler: @escaping () -> Void
     ) {
         diagLog("Stopping tunnel (reason: \(reason.rawValue))")
+        let begun = Date()
         stopHealthServer()
 
         wireGuardAdapter.stop { [weak self] error in
+            let ms = Int(Date().timeIntervalSince(begun) * 1000)
             if let error = error {
-                self?.diagLog("WireGuard adapter stop error: \(error.localizedDescription)")
+                self?.diagLog("WireGuard adapter stop error after \(ms) ms: \(error.localizedDescription)")
             } else {
-                self?.diagLog("Tunnel stopped successfully")
+                self?.diagLog("Tunnel stopped successfully in \(ms) ms")
+            }
+            if let self = self {
+                self.diagLock.lock()
+                self.lastStopMs = ms
+                self.diagLock.unlock()
             }
             completionHandler()
         }

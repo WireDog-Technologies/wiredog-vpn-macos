@@ -61,6 +61,9 @@ class KillSwitchStateMachine {
     /// applied at once to a block that is already up so a refreshed list does not wait for the next one.
     var relayCount: Int { pfManager.relayIps.count }
 
+    /// Read-only firewall report for Verbose Diagnostic Mode (see PfManager.diagnosticsReport).
+    func firewallDiagnostics() -> [String: Any] { pfManager.diagnosticsReport() }
+
     func setApiRelays(_ ips: [String]) throws {
         lock.lock(); defer { lock.unlock() }
         let before = pfManager.relayIps

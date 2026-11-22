@@ -88,29 +88,40 @@ import Darwin
 
         // Attempt to persist kill switch settings; non-fatal if permission denied
         // (WireGuard config is passed via tunnel options, not saved prefs)
+        // Timed, with the connection status at each step (read by Verbose Diagnostic Mode from the system log).
+        let begun = Date()
+        let elapsed = { Int(Date().timeIntervalSince(begun) * 1000) }
+        NSLog("[WireDog] startTunnel: requested (status %@, enabled %@)", StatusObserver.statusString(from: manager.connection.status), manager.isEnabled ? "yes" : "no")
         Task {
             do {
                 try await manager.saveToPreferences()
+                NSLog("[WireDog] startTunnel: saveToPreferences done at +%ld ms", elapsed())
                 try await manager.loadFromPreferences()
+                NSLog("[WireDog] startTunnel: loadFromPreferences done at +%ld ms", elapsed())
             } catch {
-                NSLog("[WireDog] saveToPreferences failed (non-fatal, kill switch settings not persisted): %@", error.localizedDescription)
+                NSLog("[WireDog] saveToPreferences failed at +%ld ms (non-fatal, kill switch settings not persisted): %@", elapsed(), error.localizedDescription)
             }
 
             // Start the tunnel regardless — config arrives via startVPNTunnel options
             do {
                 let session = manager.connection as? NETunnelProviderSession
+                NSLog("[WireDog] startTunnel: calling startVPNTunnel at +%ld ms (status %@)", elapsed(), StatusObserver.statusString(from: manager.connection.status))
                 let configData = try JSONSerialization.data(withJSONObject: config)
                 try session?.startVPNTunnel(options: [
                     "config": configData as NSData
                 ] as [String: NSObject])
+                NSLog("[WireDog] startTunnel: startVPNTunnel accepted at +%ld ms (status %@)", elapsed(), StatusObserver.statusString(from: manager.connection.status))
             } catch {
-                NSLog("[WireDog] startVPNTunnel error: %@", error.localizedDescription)
+                NSLog("[WireDog] startVPNTunnel error at +%ld ms (status %@): %@", elapsed(), StatusObserver.statusString(from: manager.connection.status), String(describing: error))
             }
         }
     }
 
     /// Stop the VPN tunnel
     @objc public func stopTunnel() {
+        if let connection = manager?.connection {
+            NSLog("[WireDog] stopTunnel: requested (status %@)", StatusObserver.statusString(from: connection.status))
+        }
         manager?.connection.stopVPNTunnel()
     }
 

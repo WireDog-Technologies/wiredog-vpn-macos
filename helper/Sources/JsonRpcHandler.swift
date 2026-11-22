@@ -13,17 +13,33 @@ class JsonRpcHandler {
     }
 
     /// Process a JSON-RPC 2.0 message and invoke reply with the response string (or nil for notifications)
-    func handleMessage(_ json: String, reply: @escaping (String?) -> Void) {
+    func handleMessage(_ json: String, reply rawReply: @escaping (String?) -> Void) {
         guard let data = json.data(using: .utf8),
               let message = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               message["jsonrpc"] as? String == "2.0" else {
-            reply(errorResponse(id: nil, code: -32700, message: "Parse error"))
+            rawReply(errorResponse(id: nil, code: -32700, message: "Parse error"))
             return
         }
 
         let id = message["id"]  // Could be string, number, or null
         let method = message["method"] as? String ?? ""
         let params = message["params"] as? [String: Any]
+
+        // Verbose Diagnostic Mode: every request, its parameters (never a private key) and how it ended.
+        let started = Date()
+        let verbose = HelperDiagnostics.verbose && method != "ping" && method != "getDiagnostics"
+        if verbose {
+            var shown = params ?? [:]
+            shown.removeValue(forKey: "privateKey")
+            HelperLogger.shared.info("[RPC] -> \(method) \(shown)")
+        }
+        let reply: (String?) -> Void = { response in
+            if verbose {
+                let ms = Int(Date().timeIntervalSince(started) * 1000)
+                HelperLogger.shared.info("[RPC] <- \(method) in \(ms) ms: \(String((response ?? "(no reply)").prefix(600)))")
+            }
+            rawReply(response)
+        }
 
         // Notifications (no id) don't get a response
         guard id != nil else { reply(nil); return }
@@ -32,6 +48,7 @@ class JsonRpcHandler {
         case "ping":
             reply(successResponse(id: id, result: [
                 "version": HelperVersion.current,
+                "protocol": HelperProtocol.current,
                 "uptime": ProcessInfo.processInfo.systemUptime
             ]))
 
@@ -109,6 +126,40 @@ class JsonRpcHandler {
                 "advancedEnabled": killSwitchState.advancedEnabled,
                 "advancedActive": killSwitchState.state != .disabled
             ]))
+
+        // MARK: - Self-update (protocol 4)
+
+        case "selfUpdate":
+            let path = params?["path"] as? String ?? ""
+            do {
+                let result = try SelfUpdater().update(from: path, killSwitchState: killSwitchState)
+                reply(successResponse(id: id, result: ["result": result]))
+            } catch {
+                HelperLogger.shared.warn("Self-update not done: \(error.localizedDescription)")
+                reply(errorResponse(id: id, code: -1, message: error.localizedDescription))
+            }
+
+        // MARK: - Verbose Diagnostic Mode
+
+        case "setDiagnostics":
+            HelperDiagnostics.verbose = params?["enabled"] as? Bool ?? false
+            HelperLogger.shared.info("Verbose diagnostics \(HelperDiagnostics.verbose ? "on" : "off")")
+            reply(successResponse(id: id, result: ["verbose": HelperDiagnostics.verbose]))
+
+        case "getDiagnostics":
+            // Several pfctl reads: off the socket's queue so other requests are not held up.
+            let stateMachine = killSwitchState
+            DispatchQueue.global(qos: .utility).async {
+                var result = stateMachine.firewallDiagnostics()
+                result["killSwitchState"] = stateMachine.state.rawValue
+                result["advancedEnabled"] = stateMachine.advancedEnabled
+                result["relayCount"] = stateMachine.relayCount
+                result["helperVersion"] = HelperVersion.current
+                result["helperProtocol"] = HelperProtocol.current
+                result["helperPid"] = Int(ProcessInfo.processInfo.processIdentifier)
+                result["verbose"] = HelperDiagnostics.verbose
+                reply(self.successResponse(id: id, result: result))
+            }
 
         case "emergencyReset":
             do {

@@ -26,6 +26,14 @@ class ServiceClient {
     this.reconnectTimer = null;
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 5;
+    // Called after an automatic reconnect: the helper may have restarted (a self-update, a crash, a
+    // reinstall), so the app must re-read its version and re-send what it keeps in memory.
+    this.reconnectedHandlers = [];
+  }
+
+  /** Registers a callback for a successful automatic reconnect to the helper. */
+  onReconnected(handler) {
+    this.reconnectedHandlers.push(handler);
   }
 
   /**
@@ -219,6 +227,10 @@ class ServiceClient {
         await this.connect();
       } catch (err) {
         log.warn('Reconnect failed:', err.message);
+        return;
+      }
+      for (const handler of this.reconnectedHandlers) {
+        try { await handler(); } catch (err) { log.warn('Helper reconnect handler failed:', err.message); }
       }
     }, delay);
   }

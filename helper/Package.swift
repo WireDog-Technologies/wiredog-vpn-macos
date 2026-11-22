@@ -10,7 +10,8 @@ let package = Package(
             path: "Sources",
             linkerSettings: [
                 .linkedFramework("NetworkExtension"),
-                .linkedFramework("SystemExtensions")
+                .linkedFramework("SystemExtensions"),
+                .linkedFramework("Security")
             ]
         )
     ]

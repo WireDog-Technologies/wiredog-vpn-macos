@@ -5,6 +5,8 @@ import { getCachedServerById as getServerById } from '@/lib/serverCache';
 import type { MeResponse, LoginOutcome } from '@/lib/api';
 import { transformServer, listIdFor } from '@/lib/servers';
 import { hasEntitlement, lostOrganizationAccess, organizationAccessMessage } from '@/lib/account';
+import { ConnectionTransition, ConnectStage, onConnectStage, stageText } from '@/lib/connectionProgress';
+import { vdmEvent } from '@/lib/diagnostics';
 
 interface VPNContextType {
   connection: ConnectionInfo;
@@ -12,6 +14,10 @@ interface VPNContextType {
   user: User | null;
   selectedServer: ServerLocation | null;
   isSwitchingServer: boolean;
+  // What the tunnel is in the middle of doing (null when it is settled), for the status label.
+  transition: ConnectionTransition;
+  // Progress text for the current step of a connect or disconnect, or null.
+  progressText: string | null;
   isAuthenticated: boolean;
   isAuthLoading: boolean;
   // False until the first tunnel-status read has landed, so nothing (e.g. an IP lookup) assumes
@@ -136,6 +142,15 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [isStatusResolved, setIsStatusResolved] = useState(false);
   const [advancedKillSwitchActive, setAdvancedKillSwitchActive] = useState(false);
   const [connectionError, setConnectionError] = useState<string | null>(null);
+  // The step the main process reports it is on (null when idle), whether this window started a
+  // disconnect, and whether the main process is running its auto-reconnect loop.
+  const [connectStage, setConnectStage] = useState<ConnectStage | null>(null);
+  const [isDisconnecting, setIsDisconnecting] = useState(false);
+  const [isReconnecting, setIsReconnecting] = useState(false);
+
+  useEffect(() => onConnectStage(({ stage }) => {
+    setConnectStage(stage === 'idle' ? null : stage);
+  }), []);
 
   // While a kill switch is holding the network blocked (no tunnel), backend requests go through the
   // Rescue Relay first instead of waiting out a direct attempt that cannot succeed.
@@ -272,6 +287,11 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   }, []);
 
   const disconnect = useCallback(async (options?: { disableProtection?: boolean }) => {
+    // 'connecting' keeps every control in its busy state; `transition` makes the label say DISCONNECTING.
+    // The call returns once the system has really stopped the tunnel, so the next connect cannot race it.
+    const started = Date.now();
+    vdmEvent('ui:disconnect', { options });
+    setIsDisconnecting(true);
     setConnection(prev => ({ ...prev, status: 'connecting' }));
 
     try {
@@ -281,10 +301,14 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         // Mock for browser development
         await new Promise(resolve => setTimeout(resolve, 500));
       }
+      vdmEvent('ui:disconnect-result', { ok: true, ms: Date.now() - started });
       setConnection(defaultConnection);
     } catch (error) {
       console.error('VPN disconnect failed:', error);
+      vdmEvent('ui:disconnect-result', { ok: false, ms: Date.now() - started, error: extractErrorMessage(error, 'unknown') });
       setConnection(defaultConnection);
+    } finally {
+      setIsDisconnecting(false);
     }
   }, []);
 
@@ -304,6 +328,8 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   }, [disconnect]);
 
   const connect = useCallback(async (server: ServerLocation, options?: { silent?: boolean }) => {
+    const started = Date.now();
+    vdmEvent('ui:connect', { server: server.id, city: server.city, gatewayId: server.gatewayId ?? null, silent: !!options?.silent });
     setConnectionError(null);
 
     if (!checkSubscriptionActive(user)) {
@@ -324,6 +350,7 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         // A gateway entry's list id is composite; the backend takes the node's real id plus the
         // gateway (named Dedicated IP) separately.
         const result = await window.electronAPI.vpn.connect(getConnectServerId(server), settings, server.gatewayId);
+        vdmEvent('ui:connect-result', { ok: true, ms: Date.now() - started, server: server.id });
         setConnection({
           status: 'connected',
           server,
@@ -350,6 +377,7 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     } catch (error) {
       setConnection(defaultConnection);
       const message = extractErrorMessage(error, 'Failed to connect to VPN.');
+      vdmEvent('ui:connect-result', { ok: false, ms: Date.now() - started, server: server.id, error: message });
       // Substring match, not exact equality: ConnectCancelledError/UnauthorizedError set a
       // custom .name, and Electron's IPC error serialization includes that name in the
       // wrapped message (e.g. "...: ConnectCancelledError: Connection cancelled") rather than
@@ -378,6 +406,7 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   /** Cancels an in-flight connect attempt — a first attempt or an in-progress auto-reconnect. */
   const cancelConnect = useCallback(async () => {
+    vdmEvent('ui:cancel-connect', { status: connection.status });
     if (connection.status !== 'connecting') return;
     if (window.electronAPI?.vpn?.cancelConnect) {
       await window.electronAPI.vpn.cancelConnect();
@@ -427,6 +456,8 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   // Tears down whatever's currently active and connects to `server` — the actual
   // disconnect-old-then-connect-new sequence behind quick server switching.
   const switchServer = useCallback(async (server: ServerLocation) => {
+    const started = Date.now();
+    vdmEvent('ui:switch-server', { from: connection.server?.id ?? null, to: server.id, status: connection.status });
     setIsSwitchingServer(true);
     try {
       if (connection.status === 'connecting') {
@@ -438,6 +469,7 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       }
 
       const settled = await waitForDisconnected();
+      vdmEvent('ui:switch-server-settled', { settled, ms: Date.now() - started });
       if (!settled) {
         setConnectionError('Unable to switch servers. Please try again.');
         return;
@@ -445,6 +477,7 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
       await connect(server);
     } finally {
+      vdmEvent('ui:switch-server-done', { ms: Date.now() - started });
       setIsSwitchingServer(false);
     }
   }, [connection.status, settings.permanentKillSwitch, cancelConnect, disconnect, connect, waitForDisconnected]);
@@ -468,6 +501,16 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       // Note: Do NOT sync killSwitchEnabled from backend — that reflects runtime firewall state,
       // not the user's preference. The setting persists in electron-store and is sent on connect.
       const applyStatus = (status: any) => {
+        vdmEvent('ui:status-received', {
+          status: status.status,
+          hasSession: !!status.session,
+          isReconnecting: status.isReconnecting,
+          advancedKillSwitchActive: status.advancedKillSwitchActive,
+          advancedKillSwitchEnabled: status.advancedKillSwitchEnabled,
+          reconnectGaveUp: status.reconnectGaveUp,
+          reconnectCancelled: status.reconnectCancelled,
+          authExpired: status.authExpired,
+        });
         // The login expired while the app was away and its reconnect could not continue: go back to
         // sign-in with the usual message instead of leaving a dead tunnel on screen.
         if (status.authExpired) {
@@ -486,6 +529,7 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         if (status.advancedKillSwitchEnabled !== undefined) {
           setSettings(prev => ({ ...prev, permanentKillSwitch: status.advancedKillSwitchEnabled! }));
         }
+        setIsReconnecting(!!status.isReconnecting);
 
         // Sync connection state based on status
         if (status.status === 'connected' && status.session) {
@@ -605,6 +649,7 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   }, [user?.id, isAuthLoading, isStatusResolved]);
 
   const updateSettings = useCallback((newSettings: Partial<VPNSettings>) => {
+    vdmEvent('ui:settings-change', newSettings);
     setSettings(prev => {
       const updated = { ...prev, ...newSettings };
 
@@ -807,6 +852,29 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setUser(null);
   }, [connection.status]);
 
+  // A switch shows as one SWITCHING step; a disconnect is recognized from this window's own call or
+  // from the main process (the compact window disconnects without going through this context).
+  const transition: ConnectionTransition = isSwitchingServer
+    ? 'switching'
+    : isDisconnecting || connectStage === 'disconnecting'
+      ? 'disconnecting'
+      : connection.status === 'connecting'
+        ? (isReconnecting ? 'reconnecting' : 'connecting')
+        : null;
+  const progressText = transition ? stageText(connectStage) : null;
+
+  // What the screen is showing, each time it changes: lines up the UI with the tunnel's own timeline.
+  useEffect(() => {
+    vdmEvent('ui:shown', {
+      status: connection.status,
+      transition,
+      progressText,
+      server: connection.server?.id ?? null,
+      error: connectionError,
+      advancedKillSwitchActive,
+    });
+  }, [connection.status, transition, progressText, connection.server?.id, connectionError, advancedKillSwitchActive]);
+
   return (
     <VPNContext.Provider
       value={{
@@ -815,6 +883,8 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         user,
         selectedServer,
         isSwitchingServer,
+        transition,
+        progressText,
         isAuthenticated: !!user,
         isAuthLoading,
         isStatusResolved,

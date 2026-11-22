@@ -49,11 +49,15 @@ if (!app.isPackaged) {
 const { BrowserWindow, ipcMain, Menu, Tray, shell, dialog, nativeImage, safeStorage, Notification, powerMonitor } = require('electron');
 const vpnService = require('./vpn');
 const apiRelay = require('./apiRelay');
+const diagnostics = require('./diagnostics');
 const sso = require('./sso');
 const { getInstalledApps, readPlist, extractAppIcon } = require('./utils/appDiscovery');
 
 // Configure logging
 log.transports.file.level = 'debug';
+// Past this size main.log becomes main.old.log (replacing the previous one) and a new file starts, so the
+// newest lines are always kept and the two never exceed twice this. The 1 MB default held only a few days.
+log.transports.file.maxSize = 5 * 1024 * 1024;
 
 // Log environment for debugging
 log.info('=== Environment Configuration ===');
@@ -106,6 +110,25 @@ const connectSrc = isDev
 
 // Track whether app is quitting to distinguish from hide-to-menu-bar
 let isQuitting = false;
+
+// Verbose Diagnostic Mode: what each window did (console output, navigation between screens, load
+// failures, freezes, show/hide/focus). Every call is a no-op while VDM is off.
+function attachDiagnosticsToWindow(win, label) {
+  const wc = win.webContents;
+  const levels = ['verbose', 'info', 'warning', 'error'];
+  wc.on('console-message', (_event, level, message, line, sourceId) => {
+    diagnostics.log('UI-CONSOLE', `[${label}] ${levels[level] || level}: ${message}`, sourceId ? `${path.basename(sourceId)}:${line}` : undefined);
+  });
+  wc.on('did-navigate-in-page', (_event, url) => diagnostics.log('UI-NAV', `[${label}] ${url.split('#')[1] || url}`));
+  wc.on('did-fail-load', (_event, code, description, url) => diagnostics.log('UI', `[${label}] page failed to load: ${code} ${description} ${url}`));
+  wc.on('did-finish-load', () => diagnostics.log('UI', `[${label}] page loaded`));
+  wc.on('unresponsive', () => diagnostics.log('UI', `[${label}] window became unresponsive`));
+  wc.on('responsive', () => diagnostics.log('UI', `[${label}] window responsive again`));
+  wc.on('render-process-gone', (_event, details) => diagnostics.log('UI', `[${label}] renderer process gone`, details));
+  for (const evt of ['show', 'hide', 'focus', 'blur', 'minimize', 'restore']) {
+    win.on(evt, () => diagnostics.log('UI-WINDOW', `[${label}] ${evt}`));
+  }
+}
 
 // A crashed or killed window process must not take the VPN down with it. The main process still holds the
 // tunnel, the session and the kill switch; tearing those down here (as this used to) left the user on
@@ -244,6 +267,7 @@ function createMainWindow() {
   mainWindow.webContents.on('render-process-gone', (event, details) => {
     recoverCrashedWindow(mainWindow, 'Main window', details);
   });
+  attachDiagnosticsToWindow(mainWindow, 'main');
 
   mainWindow.webContents.on('unresponsive', () => {
     log.warn('Renderer process became unresponsive');
@@ -441,6 +465,7 @@ function createCompactWindow() {
   compactWindow.webContents.on('render-process-gone', (event, details) => {
     recoverCrashedWindow(compactWindow, 'Compact window', details);
   });
+  attachDiagnosticsToWindow(compactWindow, 'compact');
 
   // Intercept reload shortcuts in compact window
   compactWindow.webContents.on('before-input-event', async (event, input) => {
@@ -821,6 +846,13 @@ function setupIpcHandlers() {
     updateTrayMenu();
   });
 
+  // Connect/disconnect progress (shown as text under the status while the tunnel is changing state).
+  vpnService.onConnectStage((stage, detail) => {
+    for (const win of [mainWindow, compactWindow]) {
+      if (win && !win.isDestroyed()) win.webContents.send('vpn:connect-stage', { stage, detail });
+    }
+  });
+
   // Renderer process logging
   ipcMain.on('renderer:log', (event, { level, message }) => {
     const prefix = '[Renderer]';
@@ -843,7 +875,10 @@ function setupIpcHandlers() {
   ipcMain.handle('settings:set', (event, newSettings) => {
     try {
       const currentSettings = settingsStore.store;
-      const merged = { ...currentSettings, ...newSettings };
+      // Verbose Diagnostic Mode is owned by the diagnostics IPC. Some screens write back a whole copy of
+      // the settings they loaded earlier, which would silently undo turning it on or off.
+      const { verboseDiagnostics: _ignored, ...incoming } = newSettings || {};
+      const merged = { ...currentSettings, ...incoming };
       settingsStore.store = merged;
       const { authToken, authUser, ...safeSettings } = merged;
       log.info('Settings updated:', safeSettings);
@@ -1001,6 +1036,21 @@ function setupIpcHandlers() {
     shell.openPath(logDir);
   });
 
+  // Verbose Diagnostic Mode (Account > Debug Logs)
+  ipcMain.handle('diagnostics:get-state', () => diagnostics.getState());
+  ipcMain.handle('diagnostics:set-enabled', async (_event, enabled) => {
+    const state = diagnostics.setEnabled(!!enabled);
+    // VDM reads the firewall's own state through the helper, which needs a helper new enough to answer.
+    if (enabled) vpnService.ensureDiagnosticsHelper().catch(err => log.warn('VDM: helper update for diagnostics failed:', err.message));
+    return state;
+  });
+  // What the screen did or showed (fire-and-forget; dropped unless VDM is on).
+  ipcMain.on('diagnostics:ui-event', (event, payload) => {
+    if (!diagnostics.isEnabled()) return;
+    const label = event.sender === compactWindow?.webContents ? 'compact' : 'main';
+    diagnostics.log('UI', `[${label}] ${payload?.name}`, payload?.data);
+  });
+
   ipcMain.handle('logs:open-service-logs', () => {
     // macOS helper daemon logs
     const serviceLogPath = '/var/log/wiredog-helper.log';
@@ -1134,6 +1184,21 @@ async function initializeSettingsStore() {
         authToken: null
       }
     });
+    // Verbose Diagnostic Mode keeps its on/off state (and when it was turned on) in the store.
+    try {
+      // The app's saved settings for the VDM snapshot, minus the secrets kept there (login token, the
+      // tunnel's private key, the anonymous account number, which is that account's only credential).
+      diagnostics.setProviders({
+        settingsSnapshot: () => {
+          const { authToken, lastConnectionPrivateKey, ...rest } = settingsStore.store;
+          if (rest.authUser?.accountNumber) rest.authUser = { ...rest.authUser, accountNumber: '<account number>' };
+          return { ...rest, authToken: authToken ? '<set>' : null, lastConnectionPrivateKey: lastConnectionPrivateKey ? '<set>' : null };
+        },
+      });
+      diagnostics.init({ store: settingsStore });
+    } catch (err) {
+      log.warn('VDM: init failed:', err.message);
+    }
     // Wire the VPN service to the store so it can persist lastConnectionConfig
     // (required for cold-start auto-reconnect when persistent_block is active)
     try { vpnService.setConfigStore(settingsStore); } catch (err) {
@@ -1166,6 +1231,8 @@ async function initializeSettingsStore() {
 /**
  * App update system
  */
+const https = require('https');
+const http = require('http');
 const { spawn } = require('child_process');
 
 function getApiBaseUrl() {
@@ -1473,6 +1540,17 @@ app.whenReady().then(async () => {
   // the sleep that caused it, and let the VPN service recover (see VPNService.handleResume).
   powerMonitor.on('suspend', () => vpnService.handleSuspend());
   powerMonitor.on('resume', () => vpnService.handleResume());
+  // Verbose Diagnostic Mode: every other power and system event (no-ops while VDM is off).
+  for (const evt of ['suspend', 'resume', 'lock-screen', 'unlock-screen', 'on-ac', 'on-battery', 'shutdown', 'user-did-become-active', 'user-did-resign-active']) {
+    powerMonitor.on(evt, () => diagnostics.log('POWER', evt, { onBattery: powerMonitor.isOnBatteryPower?.(), thermal: powerMonitor.getCurrentThermalState?.() }));
+  }
+  powerMonitor.on('thermal-state-change', (state) => diagnostics.log('POWER', 'thermal-state-change', state));
+  powerMonitor.on('speed-limit-change', (limit) => diagnostics.log('POWER', 'speed-limit-change', limit));
+  // The monitor event only observes: it does not change what Electron does with the exception.
+  process.on('uncaughtExceptionMonitor', (err, origin) => {
+    diagnostics.log('CRASH', `uncaught exception in the main process (${origin}): ${err?.stack || err}`);
+  });
+  app.on('child-process-gone', (_event, details) => diagnostics.log('CRASH', 'child process gone', details));
 
   log.info('Electron app ready (macOS)');
   await initializeSettingsStore();

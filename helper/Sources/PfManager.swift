@@ -149,6 +149,9 @@ class PfManager {
         // trailing newline — Swift's `"""` literal omits one.
         let normalized = rules.hasSuffix("\n") ? rules : rules + "\n"
         try normalized.write(toFile: tempFile, atomically: true, encoding: .utf8)
+        if HelperDiagnostics.verbose {
+            logger.info("[VDM] loading these rules into anchor \(anchorName):\n\(normalized)")
+        }
 
         // pf has to be running before the hook is checked: with pf disabled the check could not tell
         // "loaded" from "evaluated" (two connects failed that way on 2026-11-14). Enabling pf with the
@@ -179,6 +182,34 @@ class PfManager {
         guard info.contains("Status: Enabled") else { return false }
         guard rules.contains("anchor \"\(anchorName)\"") else { return false }
         return anchorRules.contains("block drop all")
+    }
+
+    /// Everything pf can tell about the kill switch, for Verbose Diagnostic Mode. Read only. Each entry is a
+    /// command's output, or why it could not be read. `-v` adds per-rule packet counters, which show whether
+    /// the block rule is the one dropping traffic.
+    func diagnosticsReport() -> [String: Any] {
+        func read(_ args: [String]) -> String {
+            do { return try capturePfctl(args) } catch { return "unavailable: \(error.localizedDescription)" }
+        }
+        var report: [String: Any] = [
+            "pfctl -s info": read(["-s", "info"]),
+            "pfctl -v -s rules (main ruleset)": read(["-v", "-s", "rules"]),
+            "pfctl -v -a \(anchorName) -s rules": read(["-v", "-a", anchorName, "-s", "rules"]),
+            "pfctl -s Anchors": read(["-s", "Anchors"]),
+            "pfctl -a com.apple -s Anchors": read(["-a", "com.apple", "-s", "Anchors"]),
+            "pfctl -s nat": read(["-s", "nat"]),
+        ]
+        let states = read(["-s", "states"])
+        report["pfctl -s states (count)"] = states.hasPrefix("unavailable") ? states : String(states.split(separator: "\n").count)
+        if let intact = isBlockIntact() {
+            report["block intact"] = intact ? "yes" : "no"
+        } else {
+            report["block intact"] = "could not read pf"
+        }
+        report["relay addresses"] = relayIps
+        report["open descriptors"] = PfManager.openDescriptorCount()
+        report["/etc/pf.conf"] = (try? String(contentsOfFile: mainRulesetPath, encoding: .utf8)) ?? "unreadable"
+        return report
     }
 
     /// Open descriptors of this process (the helper runs for weeks; a leak must be visible before it bites).

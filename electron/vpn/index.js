@@ -10,6 +10,7 @@ const serviceClient = require('../ipc/service-client');
 const { buildAllowedIPs } = require('../utils/cidrUtils');
 const health = require('./health');
 const apiRelay = require('../apiRelay');
+const vdm = require('../diagnostics');
 
 // Thrown when a connect() attempt is aborted via cancelConnect() (user tapped Connect again
 // while connecting/reconnecting). Distinguished from a real failure so callers can skip
@@ -60,13 +61,44 @@ const RESUME_GRACE_MS = 60 * 1000;
 const PROBE_INTERVAL_MS = 10 * 1000;
 const PROBE_FAILURE_THRESHOLD = 3;       // about 30-40 s of silence
 const STALE_HANDSHAKE_THRESHOLD = 2;     // consecutive checks (10 s)
-// After the tunnel starts, how long to wait for the server to answer the handshake.
-const HANDSHAKE_WAIT_MS = 10 * 1000;
+// The helper daemon is a root LaunchDaemon. Its ping reports a protocol number
+// (helper/Sources/HelperProtocol.swift); a helper below REQUIRED_HELPER_PROTOCOL is reinstalled with one
+// admin prompt (helpers from before the protocol field report none and count as 0).
+// Protocol 4 moved the helper to a root-owned copy in /Library/PrivilegedHelperTools and added
+// `selfUpdate`, so from protocol 4 on a newer helper in the app replaces the running one without a
+// password or a reboot (see _refreshHelperIfOutdated). Requiring 4 makes that one-time move for everyone:
+// the industry norm is a password on every update (Mullvad's installer, IVPN's helper upgrade).
+const REQUIRED_HELPER_PROTOCOL = 4;
+const SELF_UPDATE_HELPER_PROTOCOL = 4;
+// Where install-helper.sh puts the root-owned helper (helper/Sources/SelfUpdater.swift installedPath).
+const INSTALLED_HELPER_PATH = '/Library/PrivilegedHelperTools/com.wiredog.vpn.helper';
+// Protocol 3 added getDiagnostics/setDiagnostics for Verbose Diagnostic Mode (met by every required helper).
+const DIAGNOSTICS_HELPER_PROTOCOL = 3;
+// How long a connect waits for a helper that is restarting into a new version.
+const HELPER_REFRESH_WAIT_MS = 8000;
+// The admin prompt's wording (macOS shows it under "WireDog VPN wants to make changes").
+const HELPER_INSTALL_PROMPT = 'WireDog VPN needs to install its background helper, which runs the kill switch.';
+const HELPER_UPDATE_PROMPT = 'WireDog VPN needs to update its background helper. This is a one-time step: later updates install it automatically.';
+
+// Phase A: how long the system may take to bring the tunnel up (status connecting -> connected).
+// Measured worst case on a slow Mac was 21.6 s. A backstop against a true hang, not the normal path.
+const TUNNEL_UP_WAIT_MS = 60 * 1000;
+// Phase B: once the tunnel reports connected, how long to wait for the server to answer the handshake.
+// WireGuard retries an unanswered handshake only about every 5 s, so 10 s allowed just two attempts.
+const HANDSHAKE_WAIT_MS = 30 * 1000;
 // The system reports 'disconnected' for a moment while a tunnel is starting; only a status that
 // stays there this long means the extension is not coming up.
 const TUNNEL_START_GRACE_MS = 2000;
 // With the tunnel up but no health snapshot ever readable, stop waiting for one after this long.
 const UNREADABLE_SNAPSHOT_GIVEUP_MS = 4000;
+// macOS takes several seconds to finish tearing a tunnel down after stopVPNTunnel (measured 8 to 9 s on
+// a slow Mac). A start requested before that finishes is dropped by the system, so disconnect() waits for
+// the real teardown, and connect() waits for any teardown still in progress before starting a new tunnel.
+const DISCONNECT_SETTLE_MAX_MS = 12 * 1000;
+const PREVIOUS_TUNNEL_WAIT_MAX_MS = 15 * 1000;
+// A first connect that fails in a way a fresh attempt can fix (the server never answered, or the tunnel
+// stopped while starting) is retried this many times, quietly, before the user sees an error.
+const FIRST_CONNECT_RETRIES = 1;
 
 // Extract the UDP port from an endpoint string like "1.2.3.4:443" or "host:443".
 function extractEndpointPort(endpoint) {
@@ -223,6 +255,58 @@ class VPNService {
     this._probeAnsweredServers = new Set();
     this._probeEverAnswered = false;
     this._connectedAtMs = 0;
+    // Latest result from the system extension activation (ACTIVATED, PENDING, ERROR: ...). Lets a tunnel
+    // that stops while starting be explained correctly instead of always blaming extension approval.
+    this._sysextState = null;
+    // Listeners for connect/disconnect progress (the screen shows it as text under the status).
+    this._stageCallbacks = [];
+    // The Verbose Diagnostic Mode attempt being tracked (null when VDM is off).
+    this._vdmId = null;
+
+    vdm.setProviders({
+      getTunnelStatus: () => this._getNativeAddon()?.getStatus?.(),
+      readHealth: () => health.readTunnelHealth(),
+      apiBaseUrl: () => this.apiBaseUrl,
+      versions: () => ({ helperVersion: this.helperVersion, helperProtocol: this.helperProtocol, systemExtension: this._sysextState }),
+      // The tunnel's byte counters as the system reports them (utun interface).
+      getStats: () => this.getStats(),
+      // Firewall state the helper reads as root (pf rules, anchors, status); null when the helper is too
+      // old to answer (it then reports "Method not found").
+      helperDiagnostics: async () => (this.helperConnected ? serviceClient.request('getDiagnostics') : null),
+      // While VDM is on the helper logs every request it handles and the full rules it loads.
+      setHelperVerbose: async (enabled) => (this.helperConnected ? serviceClient.request('setDiagnostics', { enabled: !!enabled }) : null),
+      helperState: async () => {
+        if (!this.helperConnected) return { connected: false };
+        const [ping, killSwitch] = await Promise.all([
+          serviceClient.ping().catch(err => ({ error: err.message })),
+          serviceClient.request('getKillSwitchState').catch(err => ({ error: err.message })),
+        ]);
+        return { connected: true, ping, killSwitch, appKillSwitchState: this.killSwitchState };
+      },
+      describeState: () => ({
+        systemStatus: (() => { try { return this._getNativeAddon()?.getStatus?.(); } catch { return 'unknown'; } })(),
+        killSwitchState: this.killSwitchState,
+        helperConnected: this.helperConnected,
+        helperVersion: this.helperVersion,
+        tunnelManagerLoaded: this.tunnelManagerLoaded,
+        systemExtension: this._sysextState,
+        currentServerId: this.currentServerId,
+        hasSession: !!this.currentSession,
+        isReconnecting: this.isReconnecting,
+        reconnectAttempts: this.reconnectAttempts,
+        settings: {
+          killSwitch: !!this.settings?.killSwitch,
+          permanentKillSwitch: !!this.settings?.permanentKillSwitch,
+          ipv6Enabled: this.settings?.ipv6Enabled,
+          splitTunneling: !!this.settings?.splitTunneling?.enabled,
+          blockAds: this.settings?.blockAdsEnabled,
+          blockMalware: this.settings?.blockMalwareEnabled,
+        },
+      }),
+    });
+
+    // A helper that restarted (self-update, crash, reinstall) must be re-read after the socket reconnects.
+    serviceClient.onReconnected(() => this._onHelperReconnected());
 
     log.info('VPN Service initialized (macOS)');
     log.info('API Base URL:', this.apiBaseUrl);
@@ -404,7 +488,17 @@ class VPNService {
     // for 4 s, and a release sent right after the tunnel is torn down picked it up and sat on a
     // black-holed connection for ~47 s (every slow release in the first test run followed a status
     // request by less than 4 s; the fast ones did not). Header only: relay behavior is unchanged.
-    return apiRelay.apiFetch(url, { ...options, headers: { ...(options.headers || {}), Connection: 'close' } });
+    const request = apiRelay.apiFetch(url, { ...options, headers: { ...(options.headers || {}), Connection: 'close' } });
+    if (!vdm.isEnabled()) return request;
+    // VDM: every backend request the main process makes (method, path, status, time; never the body).
+    const started = Date.now();
+    const method = options.method || 'GET';
+    const pathOnly = (() => { try { return new URL(url).pathname; } catch { return String(url).split('?')[0]; } })();
+    request.then(
+      (res) => vdm.log('API', `${method} ${pathOnly} -> HTTP ${res.status} in ${Date.now() - started}ms`),
+      (err) => vdm.log('API', `${method} ${pathOnly} FAILED in ${Date.now() - started}ms: ${err?.cause?.code || err?.message}`),
+    );
+    return request;
   }
 
   /**
@@ -548,6 +642,7 @@ class VPNService {
         log.info('VPN: Helper daemon connected (version: %s)', ping.version);
         this.helperConnected = true;
         this.helperVersion = ping.version || null;
+        this.helperProtocol = ping.protocol ?? null;
         apiRelay.resend();
 
         await this._checkHelperVersionMismatch();
@@ -582,6 +677,13 @@ class VPNService {
 
         // Crash recovery: release a session the previous app instance never released.
         await this._recoverStaleSession('helper connected');
+
+        // An in-app update leaves the old helper process running. Replace it now, if nothing is active:
+        // a helper too old to update itself gets the one-time admin-prompt reinstall, a newer one updates
+        // itself without a prompt.
+        this._helperUpdatePromise = this._updateHelperIfNeeded()
+          .then(() => this._refreshHelperIfOutdated('app launch'));
+        this._helperUpdatePromise.catch(() => {});
       } catch (error) {
         log.warn('VPN: Helper daemon not available:', error.message);
         this.helperConnected = false;
@@ -671,7 +773,11 @@ class VPNService {
    * Prompts the user for their password via macOS authorization dialog.
    * @returns {Promise<boolean>} true if installation succeeded
    */
-  async installHelper() {
+  /**
+   * Installs (or reinstalls) the helper with one admin prompt. `prompt` is the sentence macOS shows in the
+   * password dialog (no apostrophes: it sits inside a single-quoted shell string).
+   */
+  async installHelper(prompt = HELPER_INSTALL_PROMPT) {
     // Helper binary is in Contents/MacOS/ (same bundle as Electron app)
     const helperBin = app.isPackaged
       ? path.join(path.dirname(process.resourcesPath), 'MacOS', 'wiredog-helper')
@@ -692,7 +798,7 @@ class VPNService {
     log.info('VPN: Helper binary:', helperBin);
 
     return new Promise((resolve, reject) => {
-      const cmd = `osascript -e 'do shell script "bash \\"${installScript}\\" \\"${helperBin}\\" \\"${plistFile}\\"" with administrator privileges'`;
+      const cmd = `osascript -e 'do shell script "bash \\"${installScript}\\" \\"${helperBin}\\" \\"${plistFile}\\"" with administrator privileges with prompt "${prompt}"'`;
 
       exec(cmd, (error, stdout, stderr) => {
         if (error) {
@@ -747,6 +853,13 @@ class VPNService {
    * @returns {Promise<boolean>}
    */
   async ensureHelperAvailable() {
+    // A helper update started at launch (admin prompt) must finish before we use the helper, and so must a
+    // silent self-update (the helper restarts for a moment).
+    if (this._helperUpdatePromise) await this._helperUpdatePromise.catch(() => {});
+    if (this._helperRefreshPromise) await this._helperRefreshPromise.catch(() => {});
+    if (this.helperConnected && this.helperNeedsUpdate && !this._helperUpdateAttempted) {
+      await this._updateHelperIfNeeded();
+    }
     if (this.helperConnected) return true;
 
     // Always reinstall — launchctl kickstart requires root (we don't have it),
@@ -839,6 +952,7 @@ class VPNService {
       // following a PENDING. See native-sysext/src/sysext_activate.mm.
       sysextAddon.activate('com.wiredog.vpn.macos.tunnel', (result) => {
         log.info('VPN: System extension activation result:', result);
+        this._sysextState = String(result);
         if (result === 'PENDING') {
           wasPending = true;
           this._notifyExtensionNeedsApproval();
@@ -948,7 +1062,7 @@ class VPNService {
 
     this._connectingServerId = serverId;
     this._connectingGatewayId = gatewayId;
-    const attempt = this._connect(serverId, settings, token, gatewayId);
+    const attempt = this._connectWithRetry(serverId, settings, token, gatewayId);
     this._connectPromise = attempt;
     try {
       return await attempt;
@@ -957,8 +1071,102 @@ class VPNService {
         this._connectPromise = null;
         this._connectingServerId = null;
         this._connectingGatewayId = null;
+        this._emitStage('idle');
       }
     }
+  }
+
+  /**
+   * One user-started connect, with a quiet retry. A failure a fresh attempt can fix (the server did not
+   * answer the handshake, or the tunnel stopped while starting) is retried with a new session before the
+   * user sees an error, while the screen keeps showing Connecting. The auto-reconnect loop has its own
+   * retries (backoff, other servers), so its attempts are not retried here.
+   */
+  async _connectWithRetry(serverId, settings, token, gatewayId) {
+    const retries = this.isReconnecting ? 0 : FIRST_CONNECT_RETRIES;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this._connect(serverId, settings, token, gatewayId);
+      } catch (error) {
+        if (attempt >= retries || !error?.retryable || this.userInitiatedDisconnect || this.isReconnecting) throw error;
+        log.warn(`VPN: Connect attempt ${attempt + 1} failed (${error.message}), retrying with a new session`);
+        this._emitStage('retrying', { reason: error.message });
+        // The failed attempt's session release is on its way; at the device limit the new /vpn/connect is
+        // refused until it lands, so give it a moment (the auto-reconnect loop does the same).
+        await Promise.race([
+          this.retryPendingDisconnects({ immediate: true }),
+          new Promise((resolve) => setTimeout(resolve, RELEASE_WAIT_MS)),
+        ]);
+        // A cancel during this pause lands on the finished attempt's token (the next attempt makes a new
+        // one), so check it here or the cancel would be lost.
+        if (this._connectAbortToken?.cancelled) throw new ConnectCancelledError();
+        if (this.userInitiatedDisconnect) throw error;
+      }
+    }
+  }
+
+  /** Registers a listener for connect/disconnect progress: (stage, detail) with stage one of
+   *  waiting-for-previous, preparing, starting-tunnel, waiting-for-server, retrying, disconnecting, idle. */
+  onConnectStage(callback) {
+    this._stageCallbacks.push(callback);
+  }
+
+  _emitStage(stage, detail = {}) {
+    if (this._vdmId) vdm.stage(this._vdmId, `UI stage: ${stage}`, detail);
+    for (const cb of this._stageCallbacks) {
+      try { cb(stage, detail); } catch (err) { log.warn('VPN: stage listener failed:', err.message); }
+    }
+  }
+
+  /**
+   * Waits until the system reports the tunnel fully down ('disconnected' or 'invalid'), up to maxMs.
+   * Returns true when it is down. macOS drops a start that arrives while the previous tunnel is still
+   * 'disconnecting', which made a quick reconnect or server switch fail.
+   */
+  async _waitForTunnelDown(maxMs, reason) {
+    const addon = this._getNativeAddon();
+    if (!addon?.getStatus) return true;
+    const read = () => { try { return addon.getStatus() || 'disconnected'; } catch { return 'unknown'; } };
+    const startedAt = Date.now();
+    let status = read();
+    if (status === 'disconnected' || status === 'invalid') return true;
+    log.info(`VPN: waiting for the system to finish stopping the tunnel (${reason}, status '${status}')`);
+    while (Date.now() - startedAt < maxMs) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      status = read();
+      if (status === 'disconnected' || status === 'invalid') {
+        log.info(`VPN: tunnel fully stopped after ${Date.now() - startedAt}ms (${reason})`);
+        return true;
+      }
+    }
+    log.warn(`VPN: tunnel still '${status}' after ${maxMs}ms (${reason})`);
+    return false;
+  }
+
+  /**
+   * Before a new tunnel is started: make sure no other one is still up or stopping. A tunnel the app no
+   * longer tracks (left over from a failed attempt, or still tearing down after a disconnect) is stopped
+   * and waited for. Throws an accurate error if the system never lets go of it.
+   */
+  async _ensureTunnelIdle(abortToken) {
+    const addon = this._getNativeAddon();
+    if (!addon?.getStatus) return;
+    let status;
+    try { status = addon.getStatus(); } catch { return; }
+    if (!status || status === 'disconnected' || status === 'invalid') return;
+    this._emitStage('waiting-for-previous', { status });
+    if (status !== 'disconnecting') {
+      log.warn(`VPN: a tunnel is still '${status}' before a new connect, stopping it first`);
+      try { addon.stopTunnel(); } catch (err) { log.warn('VPN: stopTunnel failed:', err.message); }
+    }
+    const down = await this._waitForTunnelDown(PREVIOUS_TUNNEL_WAIT_MAX_MS, 'before connect');
+    if (abortToken.cancelled) throw new ConnectCancelledError();
+    if (!down) {
+      const err = new Error('The previous VPN connection is still shutting down. Please try again in a moment.');
+      err.serverSide = false;
+      throw err;
+    }
+    this._emitStage('preparing');
   }
 
   /**
@@ -974,9 +1182,26 @@ class VPNService {
     }
   }
 
+  /** One connect attempt, recorded start to finish by Verbose Diagnostic Mode when it is on. */
   async _connect(serverId, settings, token = '', gatewayId = null) {
+    const vdmId = vdm.beginAttempt('connect', { serverId, gatewayId, reconnecting: this.isReconnecting, reconnectAttempt: this.reconnectAttempts });
+    this._vdmId = vdmId;
+    try {
+      const result = await this._connectAttempt(serverId, settings, token, gatewayId);
+      vdm.endAttempt(vdmId, 'ok');
+      return result;
+    } catch (error) {
+      vdm.endAttempt(vdmId, error instanceof ConnectCancelledError ? 'cancelled' : 'failed', error);
+      throw error;
+    } finally {
+      if (this._vdmId === vdmId) this._vdmId = null;
+    }
+  }
+
+  async _connectAttempt(serverId, settings, token = '', gatewayId = null) {
     log.info(`VPN: Connect request to server ${serverId}${gatewayId ? ` (gateway ${gatewayId})` : ''} (heldSession=${this._short(this.currentSession?.sessionId)}, configSession=${this._short(this.lastConnectionConfig?.sessionId)}, reconnecting=${this.isReconnecting})`);
     this.settings = settings;
+    this._emitStage('preparing');
 
     // Cooperative cancellation token for this specific attempt — cancelConnect() flips
     // .cancelled on whatever token is current; checked at the same two checkpoints iOS uses
@@ -989,6 +1214,7 @@ class VPNService {
     if (!available) {
       throw new Error('Helper daemon is required for VPN. Installation was canceled or failed.');
     }
+    vdm.stage(this._vdmId, 'helper ready', { helperVersion: this.helperVersion, protocol: this.helperProtocol });
 
     // Kill switch and split tunneling are mutually exclusive — enforce at service layer
     if (settings.splitTunneling?.enabled && (settings.killSwitch || settings.permanentKillSwitch)) {
@@ -997,6 +1223,11 @@ class VPNService {
 
     // Ensure system extension is activated and tunnel manager is loaded
     await this.ensureExtensionActive();
+    vdm.stage(this._vdmId, 'extension ready', { systemExtension: this._sysextState, tunnelManagerLoaded: this.tunnelManagerLoaded });
+
+    // A tunnel still stopping (a disconnect or server switch a moment ago) or left over from a failed
+    // attempt would make macOS drop the start below. Wait for it before claiming a session.
+    await this._ensureTunnelIdle(abortToken);
 
     this.connectedSince = null;
     this.authExpired = false;
@@ -1058,12 +1289,15 @@ class VPNService {
           blockMalware: settings.blockMalwareEnabled ?? true,
         };
         if (gatewayId) requestPayload.dedicatedIpId = gatewayId;
+        const requestedAt = Date.now();
+        vdm.stage(this._vdmId, 'POST /vpn/connect sent');
         response = await this._fetch(`${this.apiBaseUrl}/vpn/connect`, {
           method: 'POST',
           headers,
           credentials: 'include',
           body: JSON.stringify(requestPayload),
         });
+        vdm.stage(this._vdmId, `POST /vpn/connect answered HTTP ${response.status} in ${Date.now() - requestedAt}ms`);
 
         if (!response.ok) {
           const error = await response.json().catch(() => ({ error: 'Unknown error' }));
@@ -1122,6 +1356,21 @@ class VPNService {
       // last address this host resolved to: right after the network returns DNS can fail for a while.
       const resolvedServerIp = await this._resolveServerIp(config.endpoint);
       const serverPort = extractEndpointPort(config.endpoint);
+      if (this._vdmId) {
+        vdm.stage(this._vdmId, 'config', {
+          endpoint: config.endpoint,
+          resolvedServerIp,
+          address: config.address,
+          dns: config.dns,
+          allowedIPs: config.allowedIPs,
+          keepalive: config.persistentKeepalive,
+          awg: !!config.awg,
+          awgShape: config.awg ? { Jc: config.awg.Jc, Jmin: config.awg.Jmin, Jmax: config.awg.Jmax, S1: config.awg.S1, S2: config.awg.S2 } : null,
+          usedCachedConfig,
+          session: this._short(sessionId),
+        });
+        vdm.preflight(this._vdmId, config.endpoint, { serverIp: resolvedServerIp, address: config.address });
+      }
 
       // Transition kill switch to bootstrap state before starting tunnel. Fail closed: a connect that
       // was asked to run behind a kill switch must not carry on without one.
@@ -1190,6 +1439,8 @@ class VPNService {
       // check before starting the tunnel, mirroring iOS's Task.checkCancellation().
       if (abortToken.cancelled) throw new ConnectCancelledError();
 
+      this._emitStage('starting-tunnel');
+      vdm.stage(this._vdmId, 'calling native startTunnel', { systemStatus: (() => { try { return tunnelAddon.getStatus(); } catch { return 'unknown'; } })(), includeAllNetworks: !!settings.killSwitch });
       const tunnelStartedMs = Date.now();
       try {
       await tunnelAddon.startTunnel({
@@ -1217,6 +1468,7 @@ class VPNService {
         if (!(tunnelErr instanceof ConnectCancelledError)) tunnelErr.serverSide = true;
         throw tunnelErr;
       }
+      vdm.stage(this._vdmId, `native startTunnel resolved after ${Date.now() - tunnelStartedMs}ms (request handed to macOS, not tunnel up)`);
 
       // The tunnel just started — if a cancel landed in the narrow window right around this
       // call, tear it back down immediately rather than leaving an untracked live tunnel.
@@ -1487,6 +1739,8 @@ class VPNService {
     this.connectedSince = null;
 
     this._intentionalDisconnect = true;
+    const vdmId = vdm.beginAttempt('disconnect', { disableProtection, session: this._short(this.currentSession?.sessionId) });
+    this._emitStage('disconnecting');
     try {
       const addon = this._getNativeAddon();
       if (addon) {
@@ -1515,6 +1769,13 @@ class VPNService {
         }
       }
 
+      // Report Disconnected only once the system has really stopped the tunnel (several seconds on a
+      // slow Mac). Returning earlier let the next connect or server switch start while the old tunnel was
+      // still stopping, and macOS dropped that start. connect() also waits, as a second line of defence.
+      const teardownStartedAt = Date.now();
+      const down = await this._waitForTunnelDown(DISCONNECT_SETTLE_MAX_MS, 'disconnect');
+      vdm.stage(vdmId, `teardown ${down ? 'finished' : 'still running'} after ${Date.now() - teardownStartedAt}ms`);
+
       // Notify backend — durable cleanup (persisted + retried on failure) rather than a bare
       // fire-and-forget fetch, so a disconnect lost to a network blip doesn't leak the counter.
       if (this.currentSession) {
@@ -1540,15 +1801,20 @@ class VPNService {
         this._persistLastConnectionConfig();
       }
       log.info('VPN: Disconnected successfully');
+      vdm.endAttempt(vdmId, 'ok');
       this.notifyStatusChange();
+      // A helper update that waited for the tunnel to go down can happen now (no prompt).
+      setTimeout(() => this._refreshHelperIfOutdated('after disconnect'), 0);
 
     } catch (error) {
       log.error('VPN: Disconnect error:', error);
+      vdm.endAttempt(vdmId, 'failed', error);
       this.currentSession = null;
       this.notifyStatusChange();
       throw error;
     } finally {
       this._intentionalDisconnect = false;
+      this._emitStage('idle');
     }
   }
 
@@ -1796,17 +2062,161 @@ class VPNService {
   }
 
   /**
-   * Check if the helper daemon version mismatches the app version.
+   * Whether the running helper is too old for this app. Compares the helper protocol number, not the app
+   * version, so a release that did not change the helper never asks for an admin password.
    */
   async _checkHelperVersionMismatch() {
     if (!this.helperVersion) return;
 
-    const appVersion = app.getVersion();
-    if (this.helperVersion !== appVersion) {
-      log.warn(`VPN: Helper daemon version mismatch — helper: ${this.helperVersion}, app: ${appVersion}`);
-      this.helperNeedsUpdate = true;
-    } else {
-      this.helperNeedsUpdate = false;
+    // A helper that reports no protocol predates protocol 2 and is stale too.
+    const oldProtocol = (this.helperProtocol ?? 0) < REQUIRED_HELPER_PROTOCOL;
+    // A pre-1.2.1 LaunchDaemon runs the helper from inside the app bundle. Replacing the app swaps that
+    // file, so after a reboot or helper restart it can report protocol 4 while still running from the
+    // bundle, where it cannot self-update. No root-owned copy means the one-time move has not happened yet.
+    const notMoved = app.isPackaged && !fs.existsSync(INSTALLED_HELPER_PATH);
+    const stale = oldProtocol || notMoved;
+    if (oldProtocol) {
+      log.warn(`VPN: Helper daemon is outdated — helper: ${this.helperVersion} (protocol ${this.helperProtocol ?? 'none'}), app: ${app.getVersion()} (needs protocol ${REQUIRED_HELPER_PROTOCOL})`);
+    } else if (notMoved) {
+      log.warn(`VPN: Helper daemon (protocol ${this.helperProtocol}) still runs from the app bundle; ${INSTALLED_HELPER_PATH} is missing, so it needs the one-time reinstall`);
+    }
+    this.helperNeedsUpdate = stale;
+  }
+
+  /** True while a tunnel or any kill switch / block is in effect: replacing the helper would drop it. */
+  _isProtectionActive() {
+    if (this.killSwitchState && this.killSwitchState !== 'disabled') return true;
+    try {
+      const status = this._getNativeAddon()?.getStatus?.();
+      if (status === 'connected' || status === 'connecting' || status === 'reasserting') return true;
+    } catch { /* unknown: treat as idle */ }
+    return false;
+  }
+
+  /**
+   * Reinstall a stale helper (one admin prompt). Once per launch; never while a tunnel or block is up.
+   * A canceled or failed prompt leaves the old helper in place and the app keeps working.
+   */
+  /**
+   * Turning Verbose Diagnostic Mode on: a helper older than protocol 3 cannot report the firewall's state,
+   * so offer to update it (one admin prompt; only for users who turned VDM on). Never while a tunnel or
+   * block is up, since reinstalling the helper would drop it. Declining keeps VDM working without that part.
+   */
+  async ensureDiagnosticsHelper() {
+    if (!this.helperConnected || !app.isPackaged) return;
+    if ((this.helperProtocol ?? 0) >= DIAGNOSTICS_HELPER_PROTOCOL) {
+      await serviceClient.request('setDiagnostics', { enabled: true }).catch(() => {});
+      return;
+    }
+    if (this._isProtectionActive()) {
+      vdm.log('HELPER', `helper protocol ${this.helperProtocol ?? 'none'} is too old for firewall diagnostics; not updating it while a tunnel or block is active. Disconnect and turn VDM off and on again to update it.`);
+      return;
+    }
+    log.info(`VPN: Updating the helper for Verbose Diagnostic Mode (protocol ${this.helperProtocol ?? 'none'} < ${DIAGNOSTICS_HELPER_PROTOCOL})`);
+    try {
+      await this.installHelper(HELPER_UPDATE_PROMPT);
+      const ping = await serviceClient.ping();
+      this.helperVersion = ping.version || null;
+      this.helperProtocol = ping.protocol ?? null;
+      await this._checkHelperVersionMismatch();
+      log.info(`VPN: Helper updated for diagnostics (version: ${this.helperVersion}, protocol ${this.helperProtocol ?? 'none'})`);
+      await serviceClient.request('setDiagnostics', { enabled: true }).catch(() => {});
+      vdm.helperFirewallSnapshot('helper updated for diagnostics').catch(() => {});
+    } catch (err) {
+      log.warn('VPN: Helper update for diagnostics failed or was canceled:', err.message);
+    }
+  }
+
+  /**
+   * After an app update the running helper still runs the old code. A helper that can update itself
+   * (protocol 4+) is asked to replace itself with the one in this app: no password, no reboot. The helper
+   * checks the new copy is signed by the same team before swapping it in (helper/Sources/SelfUpdater.swift).
+   * Industry practice is to restart the helper at update time (Mullvad's installer, IVPN's helper upgrade,
+   * both with a password); ours needs none because the helper already runs as root.
+   * Only while idle (tunnel down, kill switch off or the Always-On block), the same rule the helper
+   * enforces; otherwise it happens after the next disconnect.
+   * Decided by the file, not the version text: the helper compares the app's binary with its own and does
+   * nothing when they are identical, so a rebuild under the same version number still reaches it, and a
+   * downgraded app brings its own helper back too. Asked once per app launch (a few ms of copying when
+   * nothing changed); a refusal is not retried until the next launch, a "busy" answer is.
+   */
+  _refreshHelperIfOutdated(reason) {
+    const run = async () => {
+      if (!this.helperConnected || !app.isPackaged) return;
+      if ((this.helperProtocol ?? 0) < SELF_UPDATE_HELPER_PROTOCOL) return; // gets the one-time reinstall instead
+      if (this._helperRefreshDone) return;
+
+      let status = 'disconnected';
+      try { status = this._getNativeAddon()?.getStatus?.() || 'disconnected'; } catch { /* unknown: treat as idle */ }
+      const idle = (status === 'disconnected' || status === 'invalid') &&
+        (this.killSwitchState === 'disabled' || this.killSwitchState === 'persistentBlock') &&
+        !this._connectPromise && !this.isReconnecting;
+      if (!idle) {
+        log.info(`VPN: helper refresh check waits for the next disconnect (${reason})`);
+        return;
+      }
+
+      this._helperRefreshDone = true;
+      const helperBin = path.join(path.dirname(process.resourcesPath), 'MacOS', 'wiredog-helper');
+      let result;
+      try {
+        result = (await serviceClient.request('selfUpdate', { path: helperBin }))?.result;
+      } catch (err) {
+        // The helper's own idle check can disagree for a moment (a state change in flight): try again later.
+        if (/^busy/.test(err.message || '')) this._helperRefreshDone = false;
+        log.warn(`VPN: helper self-update not done: ${err.message}`);
+        vdm.log('HELPER', `self-update not done (${reason}): ${err.message}`);
+        return;
+      }
+      log.info(`VPN: helper self-update (${reason}): ${result} (helper ${this.helperVersion}, app ${app.getVersion()})`);
+      vdm.log('HELPER', `self-update (${reason}): ${result}`);
+      if (result !== 'updated') return;
+      // The helper exits and launchd starts the new one; wait for the reconnect handler to re-read it.
+      const reconnectsBefore = this._helperReconnects || 0;
+      const startedAt = Date.now();
+      while ((this._helperReconnects || 0) === reconnectsBefore && Date.now() - startedAt < HELPER_REFRESH_WAIT_MS) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+      log.info(`VPN: helper reports version ${this.helperVersion} ${Date.now() - startedAt} ms after the self-update`);
+    };
+    this._helperRefreshPromise = run().catch(err => log.warn('VPN: helper self-update check failed:', err.message));
+    return this._helperRefreshPromise;
+  }
+
+  /**
+   * The helper connection came back after an automatic reconnect: the helper may have restarted (a
+   * self-update, a crash, a reinstall). Re-read its version and re-send what it keeps only in memory.
+   */
+  async _onHelperReconnected() {
+    const before = this.helperVersion;
+    const ping = await serviceClient.ping();
+    this.helperConnected = true;
+    this.helperVersion = ping.version || null;
+    this.helperProtocol = ping.protocol ?? null;
+    this._helperReconnects = (this._helperReconnects || 0) + 1;
+    log.info(`VPN: Helper reconnected (version: ${this.helperVersion}, protocol ${this.helperProtocol ?? 'none'}${before && before !== this.helperVersion ? `, was ${before}` : ''})`);
+    await this._checkHelperVersionMismatch();
+    apiRelay.resend();
+    if (vdm.isEnabled()) serviceClient.request('setDiagnostics', { enabled: true }).catch(() => {});
+  }
+
+  async _updateHelperIfNeeded() {
+    if (!this.helperNeedsUpdate || this._helperUpdateAttempted || !app.isPackaged) return;
+    if (this._isProtectionActive()) {
+      log.info('VPN: Helper update postponed — a tunnel or kill switch is active');
+      return;
+    }
+    this._helperUpdateAttempted = true;
+    log.info('VPN: Updating the helper daemon after an app update');
+    try {
+      await this.installHelper(HELPER_UPDATE_PROMPT);
+      const ping = await serviceClient.ping();
+      this.helperVersion = ping.version || null;
+      this.helperProtocol = ping.protocol ?? null;
+      await this._checkHelperVersionMismatch();
+      log.info(`VPN: Helper daemon updated (version: ${this.helperVersion}, protocol ${this.helperProtocol ?? 'none'})`);
+    } catch (err) {
+      log.warn('VPN: Helper update failed or was canceled, continuing with the old helper:', err.message);
     }
   }
 
@@ -1876,6 +2286,8 @@ class VPNService {
         }
         break;
     }
+    // VDM: the firewall exactly as the helper left it after this transition.
+    if (vdm.isEnabled()) vdm.helperFirewallSnapshot(`after kill switch ${oldState} -> ${newState}`).catch(() => {});
   }
 
   /**
@@ -1883,6 +2295,7 @@ class VPNService {
    */
   _handleTunnelStatusChange(status) {
     log.info('VPN: Tunnel status changed:', status);
+    vdm.noteTunnelStatus(status);
 
     if (status === 'connected') {
       this.connectedSince = Date.now();
@@ -1947,6 +2360,7 @@ class VPNService {
    */
   _handleUnexpectedDrop() {
     log.info('VPN: Unexpected tunnel disconnect — clearing stale session');
+    vdm.noteDrop('unexpected tunnel drop');
     this._lastAttemptServerSide = false;
     this._reconnectExcluded.clear();
     this._stopHealthMonitor();
@@ -2220,47 +2634,88 @@ class VPNService {
    *    happened fails the attempt.
    */
   async _verifyHandshake(sinceMs, abortToken, addon) {
-    const deadline = Date.now() + HANDSHAKE_WAIT_MS;
+    // Phase A (system brings the tunnel up) and Phase B (server answers the handshake) have separate
+    // clocks: a slow Mac or network can spend 12-21 s in Phase A alone.
+    let connectedAtMs = null;
+    const upDeadline = sinceMs + TUNNEL_UP_WAIT_MS;
+    const deadline = () => (connectedAtMs === null ? upDeadline : connectedAtMs + HANDSHAKE_WAIT_MS);
     let sawReadable = false;
     let disconnectedSince = null;
     let lastStatus = 'unknown';
-    while (Date.now() < deadline) {
+    while (Date.now() < deadline()) {
       if (abortToken.cancelled) {
         this._tearDownDeadTunnel();
         throw new ConnectCancelledError();
       }
 
+      const previousStatus = lastStatus;
       try { lastStatus = addon?.getStatus?.() || 'unknown'; } catch { lastStatus = 'unknown'; }
+      if (lastStatus !== previousStatus) {
+        vdm.stage(this._vdmId, `verify: system status ${previousStatus} -> ${lastStatus} at ${Date.now() - sinceMs}ms after start`);
+      }
       if (lastStatus === 'disconnected') {
         if (disconnectedSince === null) disconnectedSince = Date.now();
         if (Date.now() - disconnectedSince >= TUNNEL_START_GRACE_MS) {
-          log.error(`VPN: The tunnel did not come up (system status stayed '${lastStatus}' ${Date.now() - disconnectedSince}ms after start)`);
-          throw new Error('The VPN tunnel failed to start. Check that the WireDog network extension is approved in System Settings, then try again.');
+          log.error(`VPN: The tunnel did not come up (system status stayed '${lastStatus}' ${Date.now() - disconnectedSince}ms after start, extension ${this._sysextState || 'state unknown'})`);
+          // Only blame the extension when it is not known to be activated. An activated extension whose
+          // tunnel stops while starting (for example a start that raced a teardown) is worth a fresh try.
+          const activated = this._sysextState === 'ACTIVATED';
+          const err = new Error(activated
+            ? 'The VPN tunnel stopped while it was starting. Please try again.'
+            : 'The VPN tunnel failed to start. Check that the WireDog network extension is approved in System Settings, then try again.');
+          err.serverSide = false;
+          err.retryable = activated;
+          throw err;
         }
       } else {
         disconnectedSince = null;
       }
 
-      const result = await health.hasRecentHandshake(sinceMs);
-      if (result === true) {
-        log.info(`Handshake confirmed ${Date.now() - sinceMs}ms after the tunnel started (status=${lastStatus})`);
-        return;
+      if (lastStatus === 'connected' && connectedAtMs === null) {
+        connectedAtMs = Date.now();
+        log.info(`VPN: Tunnel up after ${connectedAtMs - sinceMs}ms, waiting for the server handshake`);
+        this._emitStage('waiting-for-server', { tunnelUpMs: connectedAtMs - sinceMs });
       }
-      if (result === false) sawReadable = true;
 
-      // The tunnel is up but the snapshot has never been readable: nothing more to learn by waiting.
-      if (!sawReadable && lastStatus === 'connected' && Date.now() - sinceMs >= UNREADABLE_SNAPSHOT_GIVEUP_MS) {
-        log.warn('Handshake state unknown (tunnel health snapshot not reachable from the app) — not failing the connect');
-        return;
+      // Phase A: the extension serves nothing until it is up, so do not poll its snapshot yet.
+      if (connectedAtMs !== null) {
+        const result = await health.hasRecentHandshake(sinceMs);
+        if (this._vdmId) vdm.first(this._vdmId, `handshake check first returned ${result}`);
+        if (result === true) {
+          log.info(`Handshake confirmed ${Date.now() - sinceMs}ms after the tunnel started (tunnel up ${connectedAtMs - sinceMs}ms, handshake ${Date.now() - connectedAtMs}ms later, status=${lastStatus})`);
+          return;
+        }
+        if (result === false) sawReadable = true;
+
+        // The tunnel is up but the snapshot has never been readable: nothing more to learn by waiting.
+        // Measured from connectedAtMs: from sinceMs it would fire at once on a slow Mac.
+        if (!sawReadable && lastStatus === 'connected' && Date.now() - connectedAtMs >= UNREADABLE_SNAPSHOT_GIVEUP_MS) {
+          log.warn('Handshake state unknown (tunnel health snapshot not reachable from the app) — not failing the connect');
+          return;
+        }
       }
       await new Promise(r => setTimeout(r, 250));
     }
+
+    // Phase A ran out: the system never reported connected. Not marked serverSide, so a healthy server
+    // is not excluded from the reconnect attempts.
+    if (connectedAtMs === null) {
+      log.error(`VPN: The tunnel was still '${lastStatus}' after ${TUNNEL_UP_WAIT_MS}ms`);
+      const err = new Error('The VPN tunnel is taking too long to start. Check your internet connection and try again.');
+      err.serverSide = false;
+      throw err;
+    }
+
     if (!sawReadable && lastStatus === 'connected') {
       log.warn('Handshake state unknown (tunnel health snapshot not reachable from the app) — not failing the connect');
       return;
     }
-    const err = new Error(sawReadable ? 'The server did not answer the tunnel handshake' : 'The VPN tunnel did not come up in time');
+    const err = new Error(sawReadable
+      ? 'The server did not respond. Please try again, or choose a different location.'
+      : 'The VPN tunnel did not come up in time');
     err.serverSide = sawReadable;
+    // A server that never answered is often fine a moment later with a new session.
+    err.retryable = sawReadable;
     throw err;
   }
 

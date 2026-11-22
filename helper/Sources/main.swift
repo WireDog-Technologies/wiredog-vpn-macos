@@ -77,13 +77,19 @@ dispatchMain()
 class HelperLogger {
     static let shared = HelperLogger()
     private let logPath = "/var/log/wiredog-helper.log"
-    private let fileHandle: FileHandle?
+    // Past this size the log becomes wiredog-helper.log.1 (replacing the previous .1) and a new file starts:
+    // the newest lines are always kept, and the log never uses more than twice this on disk. (It used to be
+    // emptied only when the helper started, so a helper running for weeks could grow it without limit, and
+    // the emptying erased the history just before a restart.)
+    private let maxBytes: UInt64 = 2_000_000
+    private var fileHandle: FileHandle?
+    // log() is called from the socket queue, the watchdog and background reads at the same time.
+    private let lock = NSLock()
 
     private init() {
         // Keep the log across daemon restarts and reboots (createFile on an existing path emptied it, which
-        // erased the evidence of the failure that came before a restart). Start over only past 2 MB.
-        let size = (try? FileManager.default.attributesOfItem(atPath: logPath)[.size] as? Int) ?? nil
-        if !FileManager.default.fileExists(atPath: logPath) || (size ?? 0) > 2_000_000 {
+        // erased the evidence of the failure that came before a restart).
+        if !FileManager.default.fileExists(atPath: logPath) {
             FileManager.default.createFile(atPath: logPath, contents: nil)
         }
         fileHandle = FileHandle(forWritingAtPath: logPath)
@@ -93,10 +99,26 @@ class HelperLogger {
     func log(_ level: String, _ message: String) {
         let timestamp = ISO8601DateFormatter().string(from: Date())
         let line = "[\(timestamp)] [\(level)] \(message)\n"
-        if let data = line.data(using: .utf8) {
-            fileHandle?.write(data)
+        lock.lock()
+        if let data = line.data(using: .utf8), let handle = fileHandle {
+            handle.write(data)
+            if handle.offsetInFile > maxBytes { rotate() }
         }
-        print(line, terminator: "")
+        lock.unlock()
+        // Only to a terminal (the helper run by hand). Under launchd stdout is this same file, so printing
+        // wrote each line a second time, and after a rotation it would keep growing the old file through
+        // launchd's open descriptor.
+        if isatty(STDOUT_FILENO) != 0 { print(line, terminator: "") }
+    }
+
+    /// Called with the lock held.
+    private func rotate() {
+        try? fileHandle?.close()
+        let previous = logPath + ".1"
+        try? FileManager.default.removeItem(atPath: previous)
+        try? FileManager.default.moveItem(atPath: logPath, toPath: previous)
+        FileManager.default.createFile(atPath: logPath, contents: nil)
+        fileHandle = FileHandle(forWritingAtPath: logPath)
     }
 
     func info(_ message: String) { log("INFO", message) }

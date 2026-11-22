@@ -22,6 +22,20 @@ import NetworkExtension
                   let conn = notification.object as? NEVPNConnection else { return }
 
             let status = Self.statusString(from: conn.status)
+            NSLog("[WireDog] tunnel status: %@ (connected since %@)", status, conn.connectedDate.map { "\($0)" } ?? "-")
+            // Why macOS stopped the tunnel (extension crashed, configuration problem, server unreachable...).
+            // Read by Verbose Diagnostic Mode from the system log.
+            if conn.status == .disconnected {
+                if #available(macOS 13.0, *) {
+                    conn.fetchLastDisconnectError { error in
+                        if let error = error as NSError? {
+                            NSLog("[WireDog] last disconnect error: %@ (domain %@, code %ld)", error.localizedDescription, error.domain, error.code)
+                        } else {
+                            NSLog("[WireDog] last disconnect error: none")
+                        }
+                    }
+                }
+            }
             self.callback?(status)
         }
     }

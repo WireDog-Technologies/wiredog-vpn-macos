@@ -4,15 +4,20 @@
 #
 # Usage: bash install-helper.sh <helper_binary_path> <plist_path>
 #
-# The helper binary stays inside the Electron app bundle (Contents/MacOS/)
-# so that Bundle.main resolves to the app, allowing NETunnelProviderManager
-# to find the Network Extension in Contents/PlugIns/.
+# The helper is copied to /Library/PrivilegedHelperTools (root:wheel 0755) and the LaunchDaemon runs it
+# from there, not from the app bundle: a drag-installed bundle belongs to the user, and a root daemon run
+# from a user-writable file is a local privilege escalation (anything running as the user could replace
+# it). Later helper updates need no password: the running helper replaces itself (selfUpdate RPC,
+# helper/Sources/SelfUpdater.swift) after checking the new copy is signed by the same team.
+# (The helper's NETunnelProviderManager code is unused: the app's native addon does all tunnel work.)
 set -e
 
 HELPER_BIN="$1"  # Path to helper binary inside app bundle (Contents/MacOS/wiredog-helper)
 PLIST_SRC="$2"   # Path to LaunchDaemon plist in app resources
 
 PLIST_DEST="/Library/LaunchDaemons/com.wiredog.vpn.helper.plist"
+HELPER_DEST_DIR="/Library/PrivilegedHelperTools"
+HELPER_DEST="$HELPER_DEST_DIR/com.wiredog.vpn.helper"
 
 # Validate inputs
 if [ -z "$HELPER_BIN" ] || [ -z "$PLIST_SRC" ]; then
@@ -40,13 +45,37 @@ if launchctl list 2>/dev/null | grep -q "com.wiredog.vpn.helper"; then
   sleep 1
 fi
 
-# Remove old standalone helper if it exists (migration from old format)
-rm -f "/Library/PrivilegedHelperTools/com.wiredog.vpn.helper" 2>/dev/null || true
-rm -rf "/Library/PrivilegedHelperTools/com.wiredog.vpn.helper.app" 2>/dev/null || true
+# Remove the old bundle-style helper if one is left over from an early format.
+rm -rf "$HELPER_DEST_DIR/com.wiredog.vpn.helper.app" 2>/dev/null || true
 
-# Write the LaunchDaemon plist with the correct binary path baked in.
-# The binary lives inside the app bundle so Bundle.main resolves to the app,
-# which lets NETunnelProviderManager find the Network Extension in PlugIns/.
+# Install the helper as a root-owned copy (no extended attributes such as quarantine carried over).
+mkdir -p "$HELPER_DEST_DIR"
+cp -X -f "$HELPER_BIN" "$HELPER_DEST.tmp"
+chown root:wheel "$HELPER_DEST.tmp"
+chmod 755 "$HELPER_DEST.tmp"
+mv -f "$HELPER_DEST.tmp" "$HELPER_DEST"
+echo "Helper installed at $HELPER_DEST"
+
+# macOS 13+: launchd will only start a binary signed by our team with this identifier (team-based, not
+# per build, so silent self-updates still launch). Skipped for development builds without a team.
+SIGN_INFO=$(codesign -dv "$HELPER_DEST" 2>&1 || true)
+TEAM_ID=$(echo "$SIGN_INFO" | sed -n 's/^TeamIdentifier=//p')
+SIGN_ID=$(echo "$SIGN_INFO" | sed -n 's/^Identifier=//p')
+SPAWN_CONSTRAINT=""
+if [ -n "$TEAM_ID" ] && [ "$TEAM_ID" != "not set" ] && [ -n "$SIGN_ID" ]; then
+  SPAWN_CONSTRAINT="    <key>SpawnConstraint</key>
+    <dict>
+        <key>team-identifier</key>
+        <string>${TEAM_ID}</string>
+        <key>signing-identifier</key>
+        <string>${SIGN_ID}</string>
+    </dict>"
+  echo "Launch constraint: team ${TEAM_ID}, identifier ${SIGN_ID}"
+else
+  echo "No team identifier on the helper (development build?): no launch constraint"
+fi
+
+# Write the LaunchDaemon plist pointing at the root-owned copy.
 cat > "$PLIST_DEST" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -55,11 +84,12 @@ cat > "$PLIST_DEST" << EOF
     <key>Label</key>
     <string>com.wiredog.vpn.helper</string>
     <key>Program</key>
-    <string>${HELPER_BIN}</string>
+    <string>${HELPER_DEST}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${HELPER_BIN}</string>
+        <string>${HELPER_DEST}</string>
     </array>
+${SPAWN_CONSTRAINT}
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>

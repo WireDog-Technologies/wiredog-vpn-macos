@@ -1,4 +1,5 @@
 import type { Announcement } from '@/types/announcements';
+import { vdmEvent } from '@/lib/diagnostics';
 
 // VITE_API_URL comes from .env.development (integration) or .env.production, selected
 // automatically by Vite's build mode — see those files for the actual values. The fallback
@@ -51,7 +52,23 @@ async function requestViaRelay(url: string, init: RequestInit): Promise<Response
   }
 }
 
+// Every backend request the screen makes, for Verbose Diagnostic Mode (method, path, status, time; never
+// the body, headers or query, which can hold passwords, codes or tokens).
 async function apiFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  const started = Date.now();
+  const method = init.method || 'GET';
+  const pathOnly = (() => { try { return new URL(url).pathname; } catch { return url.split('?')[0]; } })();
+  try {
+    const response = await apiFetchInner(url, init);
+    vdmEvent('api', { method, path: pathOnly, status: response.status, ms: Date.now() - started, blockedHint: apiBlockedHint });
+    return response;
+  } catch (err) {
+    vdmEvent('api', { method, path: pathOnly, error: err instanceof Error ? `${err.name}: ${err.message}` : String(err), ms: Date.now() - started, blockedHint: apiBlockedHint });
+    throw err;
+  }
+}
+
+async function apiFetchInner(url: string, init: RequestInit = {}): Promise<Response> {
   if (!window.electronAPI?.relayRequest) return fetch(url, init);
 
   const relayFirst = apiBlockedHint || Date.now() - lastDirectFailureAt < RECENT_FAILURE_MS;

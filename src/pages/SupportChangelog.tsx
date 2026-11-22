@@ -8,13 +8,26 @@ import { useElectron } from '@/context/ElectronContext';
 const SupportChangelog: React.FC = () => {
   const navigate = useNavigate();
   const { getAppVersion } = useElectron();
-  const [appVersion, setAppVersion] = useState('1.2.0');
+  const [appVersion, setAppVersion] = useState('1.2.1');
 
   useEffect(() => {
     getAppVersion().then(setAppVersion).catch(() => {});
   }, [getAppVersion]);
 
   const changelog = [
+    {
+      version: '1.2.1',
+      date: 'November 2026',
+      changes: [
+        'Fixed connections failing on some Macs, including when switching servers or reconnecting right after disconnecting.',
+        'The app now shows Disconnecting, Switching and Reconnecting, and what step a connection is on, so a slower connection never looks stuck.',
+        'If a server does not answer, the app quietly tries again before showing an error, and error messages are clearer.',
+        'WireDog only shows Connected once the server has answered, so it never shows you protected before you are.',
+        'The background helper now installs in a protected system location and keeps itself up to date automatically after this one-time update.',
+        'New Verbose Diagnostic Mode in Account > Debug Logs helps our support team solve connection problems. It never records the websites you visit.',
+        'Log files are now size-limited.',
+      ],
+    },
     {
       version: '1.2.0',
       date: 'November 2026',
